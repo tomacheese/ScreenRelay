@@ -1,0 +1,37 @@
+{
+  "app": {
+    "instance_name": "screen-relay",
+    "log_dir": "./logs",
+    "log_level": "info",
+    "metrics_path": "./state/metrics.json",
+    "health_path": "./state/health.json"
+  },
+  "capture": {
+    "backend": "dxgi",
+    "frame_timeout_ms": 100
+  },
+  "encoder": {
+    "codec": "h264_nvenc",
+    "fallback_codecs": ["h264_mf", "libx264"],
+    "bitrate_kbps": 4000,
+    "fps": 60,
+    "gop_size": 60,
+    "max_b_frames": 0,
+    "preset": "fast",
+    "tune": "zerolatency"
+  },
+  "rtsp": {
+    "base_url": "rtsp://192.168.0.100:8554",
+    "path_pattern": "/screen{n}",
+    "connect_timeout_ms": 5000,
+    "send_timeout_ms": 5000,
+    "reconnect_delay_ms": 1000,
+    "reconnect_max_delay_ms": 30000,
+    "reconnect_backoff_multiplier": 2.0
+  },
+  "runtime": {
+    "monitor_check_interval_ms": 1000,
+    "shutdown_grace_ms": 3000,
+    "emit_metrics_interval_ms": 1000
+  }
+}

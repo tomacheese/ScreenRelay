@@ -80,6 +80,17 @@ public:
      */
     bool is_running() const { return running_.load(); }
 
+    /**
+     * @brief バックエンドでハードエラー（ACCESS_LOST 等）が発生しているか返す
+     *
+     * true の場合はキャプチャの再初期化が必要。
+     *
+     * @return ハードエラーが発生していれば true
+     */
+    bool has_backend_error() const {
+        return backend_ && backend_->has_hard_error();
+    }
+
 private:
     /**
      * @brief バックグラウンドキャプチャスレッドのエントリポイント

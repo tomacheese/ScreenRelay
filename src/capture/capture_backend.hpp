@@ -55,4 +55,14 @@ public:
         static const std::string empty{};
         return empty;
     }
+
+    /**
+     * @brief DXGI ACCESS_LOST 等、再初期化が必要なハードエラーが発生しているか返す
+     *
+     * タイムアウト（画面変化なし）とは区別する。
+     * ハードエラーが発生したらフレームポンプはコンシューマーに即座に通知する。
+     *
+     * @return ハードエラーが発生していれば true
+     */
+    virtual bool has_hard_error() const { return false; }
 };

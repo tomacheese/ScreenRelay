@@ -31,6 +31,7 @@ void StateMachine::build_transition_table() {
         {S::CONNECTING,    S::STREAMING},
         {S::CONNECTING,    S::CAPTURING},
         {S::CONNECTING,    S::STOPPING},
+        {S::CONNECTING,    S::FATAL},
 
         // STREAMING からの遷移
         {S::STREAMING,     S::RECONNECTING},
@@ -46,6 +47,7 @@ void StateMachine::build_transition_table() {
         // RECONFIGURING からの遷移
         {S::RECONFIGURING, S::CAPTURING},
         {S::RECONFIGURING, S::STOPPING},
+        {S::RECONFIGURING, S::FATAL},
 
         // STOPPING と FATAL は terminal ステートのため遷移なし
     };

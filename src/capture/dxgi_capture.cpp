@@ -62,6 +62,8 @@ DxgiCaptureBackend::~DxgiCaptureBackend() {
  * @return 成功した場合 true
  */
 bool DxgiCaptureBackend::init(HMONITOR monitor, int logical_width, int logical_height) {
+    // 再初期化時はハードエラーフラグをクリアする
+    hard_error_     = false;
     logical_width_  = logical_width;
     logical_height_ = logical_height;
 
@@ -112,11 +114,13 @@ std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
     );
 
     if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
-        // タイムアウトは正常。フレームなしで返す
+        // タイムアウトは正常（画面に変化なし）。フレームなしで返す
         return std::nullopt;
     }
 
     if (FAILED(hr)) {
+        // ACCESS_LOST 等の回復不能エラー。ハードエラーフラグを立ててコンシューマーに通知する
+        hard_error_ = true;
         last_error_ = "AcquireNextFrame failed: HRESULT=" + std::to_string(static_cast<long>(hr));
         return std::nullopt;
     }

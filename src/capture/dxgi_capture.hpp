@@ -69,6 +69,15 @@ public:
      */
     const std::string& last_error() const { return last_error_; }
 
+    /**
+     * @brief DXGI ACCESS_LOST 等のハードエラーが発生しているか返す
+     *
+     * init() を呼び出すとフラグはリセットされる。
+     *
+     * @return ハードエラーが発生していれば true
+     */
+    bool has_hard_error() const override { return hard_error_; }
+
 private:
     /**
      * @brief HMONITOR に対応する DXGI アダプターとアウトプットを検索して初期化する
@@ -84,4 +93,5 @@ private:
     int logical_width_  = 0;   ///< 論理解像度の幅
     int logical_height_ = 0;   ///< 論理解像度の高さ
     std::string last_error_;   ///< 最後のエラーメッセージ
+    bool hard_error_ = false;  ///< ACCESS_LOST 等の再初期化が必要なエラーフラグ
 };

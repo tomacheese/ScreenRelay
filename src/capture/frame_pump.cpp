@@ -169,6 +169,9 @@ void FramePump::capture_thread_func() {
 
             // コンシューマーにフレーム到着を通知する
             cv_.notify_one();
+        } else if (backend_->has_hard_error()) {
+            // ACCESS_LOST 等のハードエラー発生時はコンシューマーを即座に起こす
+            cv_.notify_all();
         }
         // acquire_frame がタイムアウトした場合は追加のスリープなしに次のループへ進む
     }

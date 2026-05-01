@@ -1,0 +1,17 @@
+# 実際の環境値を含むローカル設定
+config/config.json
+
+# ビルド成果物と CMake FetchContent キャッシュ
+build/
+
+# ランタイム状態
+state/
+logs/
+
+# ダウンロードしたバイナリ依存（コミット対象外）
+deps/ffmpeg/
+deps/mediamtx/
+deps/*.zip
+
+# テスト用一時ファイル
+test_*_tmp.json

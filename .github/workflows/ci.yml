@@ -1,0 +1,236 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    branches:
+      - master
+  pull_request_target:
+    branches:
+      - master
+    types:
+      - opened
+      - synchronize
+      - reopened
+      - closed
+  merge_group:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  calc-version:
+    name: 🔢 Calculate next version
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request_target'
+    permissions:
+      contents: write
+
+    outputs:
+      tag: ${{ steps.tag-version.outputs.new_tag }}
+      changelog: ${{ steps.tag-version.outputs.changelog }}
+
+    steps:
+      - name: 🛎 Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ github.event.pull_request.merged == true && github.base_ref || github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: 🏷 Bump version and push tag
+        id: tag-version
+        uses: mathieudutour/github-tag-action@v6.2
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          default_bump: "minor"
+          custom_release_rules: "feat:minor:✨ Features,fix:patch:🐛 Fixes,docs:patch:📰 Docs,chore:patch:🎨 Chore,pref:patch:🎈 Performance improvements,refactor:patch:🧹 Refactoring,build:patch:🔍 Build,ci:patch:🔍 CI,revert:patch:⏪ Revert,style:patch:🧹 Style,test:patch:👀 Test,release:major:📦 Release"
+          dry_run: ${{ github.event.pull_request.merged == true && 'false' || 'true' }}
+
+  post-approval-request:
+    name: 📢 Request fork PR approval
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      (github.event.action == 'opened' || github.event.action == 'reopened')
+    permissions:
+      pull-requests: write
+    steps:
+      - name: 📝 Post approval request comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo '${{ github.repository }}' \
+            --body '⚠️ **このフォーク PR はビルド承認が必要です**
+
+          リポジトリのメンテナーが **`fork-pr-build`** Environment を承認するまで、ビルドは開始されません。
+
+          Actions タブで当該ワークフローを開き、承認を行ってください。'
+
+  approval-gate:
+    name: 🔐 Fork PR approval gate
+    runs-on: ubuntu-latest
+    # フォーク PR (非 closed) のみ fork-pr-build environment を要求し、それ以外は空文字で即通過
+    environment: ${{ (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository && github.event.action != 'closed') && 'fork-pr-build' || '' }}
+    steps:
+      - name: Approved
+        run: echo "Build approved"
+
+  cpp-build:
+    name: 🏗️ Build & Test (Windows / MinGW64)
+    runs-on: windows-latest
+    needs:
+      - calc-version
+      - approval-gate
+    if: >-
+      always() &&
+      (needs.calc-version.result == 'success' || needs.calc-version.result == 'skipped') &&
+      (needs.approval-gate.result == 'success' || needs.approval-gate.result == 'skipped') &&
+      (github.event.action != 'closed' || github.event.pull_request.merged == true)
+    permissions:
+      contents: write
+
+    steps:
+      - name: 🛎 Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: "${{ github.event.pull_request.merged == true && github.base_ref || github.event.pull_request.head.sha || github.sha }}"
+
+      - name: 🏗 Setup MSYS2 / MinGW64
+        uses: msys2/setup-msys2@e9898307ac31d1a803454791be09ab9973336e1c # v2.31.1
+        with:
+          msystem: MINGW64
+          update: true
+          cache: true
+          install: >-
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-cmake
+            mingw-w64-x86_64-ninja
+            mingw-w64-x86_64-pkg-config
+
+      - name: 📥 Download FFmpeg LGPL shared build
+        shell: pwsh
+        run: |
+          $release = Invoke-RestMethod -Uri "https://api.github.com/repos/BtbN/FFmpeg-Builds/releases/latest" -UseBasicParsing
+          $asset = $release.assets |
+            Where-Object { $_.name -match '^ffmpeg-N-.*-win64-lgpl-shared\.zip$' } |
+            Select-Object -First 1
+          if (-not $asset) {
+            $asset = $release.assets |
+              Where-Object { $_.name -match 'win64-lgpl-shared\.zip$' } |
+              Select-Object -First 1
+          }
+          if (-not $asset) { throw "No win64-lgpl-shared asset found in latest BtbN FFmpeg release" }
+          $url = $asset.browser_download_url
+          Write-Host "Downloading: $($asset.name)"
+          $zip = "$env:TEMP\ffmpeg-lgpl.zip"
+          Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
+          Expand-Archive -Path $zip -DestinationPath "$env:TEMP\ffmpeg-lgpl" -Force
+          $inner = (Get-ChildItem "$env:TEMP\ffmpeg-lgpl" | Select-Object -First 1).FullName
+          New-Item -ItemType Directory -Force deps\ffmpeg | Out-Null
+          Copy-Item "$inner\*" deps\ffmpeg -Recurse -Force
+          Write-Host "FFmpeg LGPL: $((& deps\ffmpeg\bin\ffmpeg.exe -version 2>&1)[0])"
+
+      - name: 🔧 Configure CMake
+        shell: msys2 {0}
+        run: |
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw.cmake \
+            -DBUILD_TESTS=ON
+        env:
+          MINGW_BIN: /mingw64/bin
+          MINGW_ROOT: /mingw64/x86_64-w64-mingw32
+
+      - name: 🏗️ Build
+        shell: msys2 {0}
+        run: cmake --build build --parallel
+
+      - name: 🧪 Run unit tests
+        shell: msys2 {0}
+        run: ./build/tests/screen_relay_tests.exe
+
+      - name: 📦 Package binary
+        shell: msys2 {0}
+        run: |
+          mkdir -p dist
+          cp build/screen-relay.exe dist/
+          strip dist/screen-relay.exe
+          cp deps/ffmpeg/bin/*.dll dist/
+          cp /mingw64/bin/libwinpthread-1.dll dist/
+          cp THIRD_PARTY_LICENSES.md dist/
+          echo "Packaged $(ls dist/ | wc -l) files (EXE + FFmpeg LGPL DLLs + MinGW runtime + THIRD_PARTY_LICENSES.md)"
+
+      - name: 📦 Upload artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: screen-relay-win64
+          path: dist/
+
+      - name: 📦 Package release archive
+        id: package
+        if: github.event.pull_request.merged == true
+        shell: pwsh
+        run: |
+          $VERSION = "${{ needs.calc-version.outputs.tag }}"
+          $ARCHIVE = "screen-relay-${VERSION}-win64.zip"
+          if (Test-Path config\config.example.json) { Copy-Item config\config.example.json dist\ }
+          if (Test-Path README.md) { Copy-Item README.md dist\ }
+          Compress-Archive -Path dist\* -DestinationPath $ARCHIVE -Force
+          "archive=$ARCHIVE" >> $env:GITHUB_OUTPUT
+          $count = (Get-ChildItem dist).Count
+          Write-Host "Packaged $count files into $ARCHIVE"
+
+      - name: 🎉 Create GitHub Release
+        if: github.event.pull_request.merged == true
+        uses: ncipollo/release-action@v1.21.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag: ${{ needs.calc-version.outputs.tag }}
+          name: ${{ needs.calc-version.outputs.tag }}
+          body: ${{ needs.calc-version.outputs.changelog }}
+          artifacts: ${{ steps.package.outputs.archive }}
+          draft: false
+          prerelease: false
+
+  finished-ci:
+    name: ✅ CI
+    runs-on: ubuntu-latest
+    if: always()
+    needs:
+      - calc-version
+      - approval-gate
+      - cpp-build
+
+    steps:
+      - name: 🔍 Check build status
+        run: |
+          calc_result="${{ needs.calc-version.result }}"
+          approval_result="${{ needs.approval-gate.result }}"
+          build_result="${{ needs.cpp-build.result }}"
+          echo "calc-version: $calc_result"
+          echo "approval-gate: $approval_result"
+          echo "cpp-build: $build_result"
+          if [ "$calc_result" != "success" ] && [ "$calc_result" != "skipped" ]; then
+            echo "Version calculation failed"
+            exit 1
+          fi
+          if [ "$approval_result" != "success" ] && [ "$approval_result" != "skipped" ]; then
+            echo "Fork PR build rejected or timed out"
+            exit 1
+          fi
+          if [ "$build_result" != "success" ] && [ "$build_result" != "skipped" ]; then
+            echo "Build/test failed"
+            exit 1
+          fi

@@ -20,7 +20,7 @@ struct AppConfig {
 
     /** @brief キャプチャ設定 */
     struct Capture {
-        std::string backend       = "dxgi";  ///< キャプチャバックエンド ("dxgi" または "wgc")
+        std::string backend       = "dxgi";  ///< キャプチャバックエンド (現時点は "dxgi" のみ)
         int frame_timeout_ms      = 100;     ///< フレーム取得タイムアウト (ms)
     } capture;
 

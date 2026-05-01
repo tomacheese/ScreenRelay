@@ -54,7 +54,7 @@ static void test_load_all_sections() {
         "health_path": "./state/h.json"
       },
       "capture": {
-        "backend": "wgc",
+        "backend": "dxgi",
         "frame_timeout_ms": 200
       },
       "encoder": {
@@ -85,7 +85,7 @@ static void test_load_all_sections() {
     cleanup(path);
     VERIFY_MSG(ok, "Full config should load");
     VERIFY(cfg.app.instance_name == "test-01");
-    VERIFY(cfg.capture.backend == "wgc");
+    VERIFY(cfg.capture.backend == "dxgi");
     VERIFY(cfg.encoder.codec == "libx264");
     VERIFY(cfg.encoder.fps == 30);
     // fallback_codecs が正しく読み込まれること
@@ -147,6 +147,22 @@ static void test_invalid_fps_fails() {
     printf("[PASS] test_invalid_fps_fails\n");
 }
 
+/** @brief 未実装のキャプチャバックエンドを指定した場合にエラーになること */
+static void test_invalid_backend_fails() {
+    const std::string json = R"({
+      "capture": { "backend": "wgc" },
+      "rtsp": { "base_url": "rtsp://host:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(!ok, "Unsupported backend should fail");
+    printf("[PASS] test_invalid_backend_fails\n");
+}
+
 /** @brief base_url が "rtsp://" で始まらない場合にエラーになること */
 static void test_invalid_rtsp_url_prefix_fails() {
     const std::string json = R"({
@@ -175,5 +191,6 @@ int run_config_loader_tests() {
     test_missing_rtsp_base_url_fails();
     test_invalid_fps_fails();
     test_invalid_rtsp_url_prefix_fails();
+    test_invalid_backend_fails();
     return 0;
 }

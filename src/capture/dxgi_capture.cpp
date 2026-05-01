@@ -63,7 +63,7 @@ DxgiCaptureBackend::~DxgiCaptureBackend() {
  */
 bool DxgiCaptureBackend::init(HMONITOR monitor, int logical_width, int logical_height) {
     // 再初期化時はハードエラーフラグをクリアする
-    hard_error_     = false;
+    hard_error_.store(false);
     logical_width_  = logical_width;
     logical_height_ = logical_height;
 
@@ -99,7 +99,10 @@ bool DxgiCaptureBackend::init(HMONITOR monitor, int logical_width, int logical_h
  */
 std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
     if (!impl_->duplication) {
-        last_error_ = "Not initialized";
+        {
+            std::lock_guard<std::mutex> lk(last_error_mutex_);
+            last_error_ = "Not initialized";
+        }
         return std::nullopt;
     }
 
@@ -119,9 +122,14 @@ std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
     }
 
     if (FAILED(hr)) {
-        // ACCESS_LOST 等の回復不能エラー。ハードエラーフラグを立ててコンシューマーに通知する
-        hard_error_ = true;
-        last_error_ = "AcquireNextFrame failed: HRESULT=" + std::to_string(static_cast<long>(hr));
+        // ACCESS_LOST 等の回復不能エラー。
+        // last_error_ を先に書き込んでから atomic フラグを立てることで
+        // コンシューマーがフラグを読んだ際に文字列が確実に可視となる。
+        {
+            std::lock_guard<std::mutex> lk(last_error_mutex_);
+            last_error_ = "AcquireNextFrame failed: HRESULT=" + std::to_string(static_cast<long>(hr));
+        }
+        hard_error_.store(true);
         return std::nullopt;
     }
 
@@ -132,7 +140,10 @@ std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
     desktop_resource = nullptr;
 
     if (FAILED(hr) || !tex) {
-        last_error_ = "QueryInterface for ID3D11Texture2D failed";
+        {
+            std::lock_guard<std::mutex> lk(last_error_mutex_);
+            last_error_ = "QueryInterface for ID3D11Texture2D failed";
+        }
         impl_->duplication->ReleaseFrame();
         return std::nullopt;
     }
@@ -146,7 +157,10 @@ std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
     D3D11_MAPPED_SUBRESOURCE mapped{};
     hr = impl_->context->Map(impl_->staging_tex, 0, D3D11_MAP_READ, 0, &mapped);
     if (FAILED(hr)) {
-        last_error_ = "ID3D11DeviceContext::Map failed";
+        {
+            std::lock_guard<std::mutex> lk(last_error_mutex_);
+            last_error_ = "ID3D11DeviceContext::Map failed";
+        }
         impl_->duplication->ReleaseFrame();
         return std::nullopt;
     }

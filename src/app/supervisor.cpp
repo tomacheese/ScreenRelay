@@ -272,22 +272,21 @@ void ScreenPipeline::do_streaming_loop() {
             freeze_meta = meta;
             has_freeze  = true;
             metrics_->increment_frames_received(monitor_info_.number);
-        } else {
-            // フレームなし（画面変化なし、または wait_ms 未満での早期チェック）
-
-            // 次の送信時刻になっていなければスキップする
-            if (frame_sw.elapsed_us() < frame_interval_us) {
-                continue;
-            }
-
-            // フリーズフレームがなければ最初のフレームがまだ来ていない
-            if (!has_freeze) {
-                continue;
-            }
-
-            // フリーズフレームを現在のタイムスタンプで繰り返す（静止画面対応）
-            freeze_meta.timestamp_us = time_utils::system_now_us();
         }
+
+        // 送信間隔に達していなければスキップする（新規フレームも同様）
+        // これにより画面更新が速い場合でも設定 fps を超えて送信しない
+        if (frame_sw.elapsed_us() < frame_interval_us) {
+            continue;
+        }
+
+        // フリーズフレームがなければ最初のフレームがまだ来ていない
+        if (!has_freeze) {
+            continue;
+        }
+
+        // 送信タイムスタンプを現在時刻に統一する（フリーズフレーム・新規フレーム共通）
+        freeze_meta.timestamp_us = time_utils::system_now_us();
 
         // フレーム送信タイマーをリセットする
         frame_sw.reset();

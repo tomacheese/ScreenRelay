@@ -2,7 +2,9 @@
 #include "capture/capture_backend.hpp"
 #include <d3d11.h>
 #include <dxgi1_2.h>
+#include <atomic>
 #include <memory>
+#include <mutex>
 #include <string>
 
 /**
@@ -65,18 +67,24 @@ public:
 
     /**
      * @brief 最後のエラーメッセージを取得する
-     * @return エラーメッセージ文字列
+     *
+     * スレッドセーフ。acquire_frame() と並行して呼び出し可能。
+     *
+     * @return エラーメッセージ文字列のコピー
      */
-    const std::string& last_error() const { return last_error_; }
+    std::string last_error() const override {
+        std::lock_guard<std::mutex> lk(last_error_mutex_);
+        return last_error_;
+    }
 
     /**
      * @brief DXGI ACCESS_LOST 等のハードエラーが発生しているか返す
      *
-     * init() を呼び出すとフラグはリセットされる。
+     * init() を呼び出すとフラグはリセットされる。スレッドセーフ。
      *
      * @return ハードエラーが発生していれば true
      */
-    bool has_hard_error() const override { return hard_error_; }
+    bool has_hard_error() const override { return hard_error_.load(); }
 
 private:
     /**
@@ -92,6 +100,8 @@ private:
 
     int logical_width_  = 0;   ///< 論理解像度の幅
     int logical_height_ = 0;   ///< 論理解像度の高さ
-    std::string last_error_;   ///< 最後のエラーメッセージ
-    bool hard_error_ = false;  ///< ACCESS_LOST 等の再初期化が必要なエラーフラグ
+
+    mutable std::mutex last_error_mutex_;           ///< last_error_ 保護用ミューテックス
+    std::string        last_error_;                 ///< 最後のエラーメッセージ (last_error_mutex_ 保護下)
+    std::atomic<bool>  hard_error_{false};          ///< ACCESS_LOST 等の再初期化が必要なエラーフラグ
 };

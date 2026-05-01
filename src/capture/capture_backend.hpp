@@ -49,11 +49,13 @@ public:
 
     /**
      * @brief 最後のエラーメッセージを返す
-     * @return エラーメッセージ文字列
+     *
+     * スレッドセーフな実装が必要な場合は派生クラスでオーバーライドする。
+     *
+     * @return エラーメッセージ文字列のコピー
      */
-    virtual const std::string& last_error() const {
-        static const std::string empty{};
-        return empty;
+    virtual std::string last_error() const {
+        return {};
     }
 
     /**

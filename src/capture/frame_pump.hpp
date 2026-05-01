@@ -106,6 +106,7 @@ private:
     int              frame_timeout_ms_ = 100;     ///< フレーム取得タイムアウト (ms)
 
     std::atomic<bool>    running_{false};          ///< スレッド実行フラグ
+    std::atomic<bool>    backend_hard_error_{false};  ///< バックエンドハードエラーフラグ (wait_pop 短絡用)
     mutable std::mutex   mutex_;                   ///< キュー保護ミューテックス
     std::condition_variable cv_;                   ///< フレーム到着通知用条件変数
     std::queue<std::pair<FrameBuffer, FrameMeta>> queue_;  ///< フレームキュー

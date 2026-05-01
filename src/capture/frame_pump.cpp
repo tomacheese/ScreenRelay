@@ -44,6 +44,7 @@ void FramePump::start(ICaptureBackend* backend, int frame_timeout_ms) {
 
     backend_          = backend;
     frame_timeout_ms_ = frame_timeout_ms;
+    backend_hard_error_.store(false);
     running_.store(true);
 
     // 再起動時に残留した古い解像度のフレームをクリアする
@@ -113,9 +114,9 @@ bool FramePump::wait_pop(FrameBuffer& buf, FrameMeta& meta, int timeout_ms) {
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
 
-    // キューが空かつ実行中の間は待機する
+    // キューが空かつ実行中かつハードエラーなしの間は待機する
     bool notified = cv_.wait_until(lk, deadline, [this]() {
-        return !queue_.empty() || !running_.load();
+        return !queue_.empty() || !running_.load() || backend_hard_error_.load();
     });
 
     if (!notified || queue_.empty()) {
@@ -170,7 +171,9 @@ void FramePump::capture_thread_func() {
             // コンシューマーにフレーム到着を通知する
             cv_.notify_one();
         } else if (backend_->has_hard_error()) {
-            // ACCESS_LOST 等のハードエラー発生時はコンシューマーを即座に起こす
+            // ACCESS_LOST 等のハードエラー発生時はフラグをセットしてコンシューマーを即座に起こす
+            // backend_hard_error_ を先にセットすることで wait_pop の述語が確実に true になる
+            backend_hard_error_.store(true);
             cv_.notify_all();
         }
         // acquire_frame がタイムアウトした場合は追加のスリープなしに次のループへ進む

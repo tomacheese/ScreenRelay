@@ -327,12 +327,11 @@ void ScreenPipeline::do_streaming_loop() {
  * stop_requested_ が立った場合は STOPPING に遷移して終了する。
  */
 void ScreenPipeline::do_reconnect() {
-    // 既存の RTSP クライアントを解放する
-    for (auto& client : rtsp_clients_) {
-        if (client->is_connected())
-            log_->log_publish_stopped(monitor_info_.number, "reconnecting");
-        client->disconnect();
-    }
+    // 接続中のクライアントがあれば停止を1回だけ記録して解放する
+    bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
+                                     [](const auto& c) { return c->is_connected(); });
+    if (was_connected) log_->log_publish_stopped(monitor_info_.number, "reconnecting");
+    for (auto& client : rtsp_clients_) client->disconnect();
     rtsp_clients_.clear();
 
     while (!stop_requested_.load()) {
@@ -400,12 +399,11 @@ void ScreenPipeline::do_reconfigure() {
     // フレームポンプを一時停止する
     if (frame_pump_) frame_pump_->stop();
 
-    // 既存の RTSP クライアントを解放する
-    for (auto& client : rtsp_clients_) {
-        if (client->is_connected())
-            log_->log_publish_stopped(monitor_info_.number, "reconfiguring");
-        client->disconnect();
-    }
+    // 接続中のクライアントがあれば停止を1回だけ記録して解放する
+    bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
+                                     [](const auto& c) { return c->is_connected(); });
+    if (was_connected) log_->log_publish_stopped(monitor_info_.number, "reconfiguring");
+    for (auto& client : rtsp_clients_) client->disconnect();
     rtsp_clients_.clear();
 
     // エンコーダーをフラッシュして解放する
@@ -471,11 +469,11 @@ void ScreenPipeline::teardown_all() {
         frame_pump_.reset();
     }
 
-    for (auto& client : rtsp_clients_) {
-        if (client->is_connected())
-            log_->log_publish_stopped(monitor_info_.number, "teardown");
-        client->disconnect();
-    }
+    // 接続中のクライアントがあれば停止を1回だけ記録して解放する
+    bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
+                                     [](const auto& c) { return c->is_connected(); });
+    if (was_connected) log_->log_publish_stopped(monitor_info_.number, "teardown");
+    for (auto& client : rtsp_clients_) client->disconnect();
     rtsp_clients_.clear();
 
     if (encoder_) {

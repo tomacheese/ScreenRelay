@@ -49,6 +49,8 @@ bool LogSink::init(const std::string& log_dir,
         // 不明なレベルはデフォルトの info を使用する
 
         logger_->set_level(level);
+        // info 以上のメッセージは即時フラッシュしてリアルタイムに tail -f で参照できるようにする
+        logger_->flush_on(spdlog::level::info);
 
     } catch (const std::exception& e) {
         error = std::string("Failed to init log sink: ") + e.what();

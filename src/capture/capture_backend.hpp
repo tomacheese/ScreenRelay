@@ -49,10 +49,22 @@ public:
 
     /**
      * @brief 最後のエラーメッセージを返す
-     * @return エラーメッセージ文字列
+     *
+     * スレッドセーフな実装が必要な場合は派生クラスでオーバーライドする。
+     *
+     * @return エラーメッセージ文字列のコピー
      */
-    virtual const std::string& last_error() const {
-        static const std::string empty{};
-        return empty;
+    virtual std::string last_error() const {
+        return {};
     }
+
+    /**
+     * @brief DXGI ACCESS_LOST 等、再初期化が必要なハードエラーが発生しているか返す
+     *
+     * タイムアウト（画面変化なし）とは区別する。
+     * ハードエラーが発生したらフレームポンプはコンシューマーに即座に通知する。
+     *
+     * @return ハードエラーが発生していれば true
+     */
+    virtual bool has_hard_error() const { return false; }
 };

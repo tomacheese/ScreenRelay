@@ -80,6 +80,17 @@ public:
      */
     bool is_running() const { return running_.load(); }
 
+    /**
+     * @brief バックエンドでハードエラー（ACCESS_LOST 等）が発生しているか返す
+     *
+     * true の場合はキャプチャの再初期化が必要。
+     *
+     * @return ハードエラーが発生していれば true
+     */
+    bool has_backend_error() const {
+        return backend_ && backend_->has_hard_error();
+    }
+
 private:
     /**
      * @brief バックグラウンドキャプチャスレッドのエントリポイント
@@ -95,6 +106,7 @@ private:
     int              frame_timeout_ms_ = 100;     ///< フレーム取得タイムアウト (ms)
 
     std::atomic<bool>    running_{false};          ///< スレッド実行フラグ
+    std::atomic<bool>    backend_hard_error_{false};  ///< バックエンドハードエラーフラグ (wait_pop 短絡用)
     mutable std::mutex   mutex_;                   ///< キュー保護ミューテックス
     std::condition_variable cv_;                   ///< フレーム到着通知用条件変数
     std::queue<std::pair<FrameBuffer, FrameMeta>> queue_;  ///< フレームキュー

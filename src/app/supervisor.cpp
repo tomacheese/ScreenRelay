@@ -109,11 +109,13 @@ bool ScreenPipeline::do_init_and_capture() {
         return false;
     }
 
-    // 最初のフレームを待って解像度を確認する
+    // 最初のフレームを待って解像度を確認する。
+    // DXGI は画面変化がなくても DuplicateOutput 直後の最初のフレームは返すが、
+    // 高負荷時や静止画面では時間がかかる場合があるため十分な時間を与える。
     FrameBuffer buf;
     FrameMeta   meta;
     bool got_frame = frame_pump_->wait_pop(buf, meta,
-                                            config_.capture.frame_timeout_ms * 10);
+                                            config_.capture.frame_timeout_ms * 100);
     if (!got_frame) {
         log_->log_error("FIRST_FRAME_TIMEOUT",
                         "Timeout waiting for first frame from monitor "
@@ -215,43 +217,81 @@ bool ScreenPipeline::do_connect() {
  *
  * STREAMING ステート中に呼び出す。フレームを取得してエンコードし、
  * 全 RTSP クライアントに送信する。
+ *
+ * DXGI Desktop Duplication は画面に変化がない場合フレームを送らないため、
+ * 最後に受信したフレームを設定 fps に合わせて繰り返し送信する（フリーズフレーム）。
+ * DXGI ハードエラー（ACCESS_LOST 等）を検出した場合は即座に RECONFIGURING に遷移する。
  */
 void ScreenPipeline::do_streaming_loop() {
     time_utils::Stopwatch metrics_sw;
-    time_utils::Stopwatch stall_sw;   // フレーム無受信の継続時間を計測する
     uint64_t bytes_since_last  = 0;
     uint64_t frames_since_last = 0;
 
-    // DXGI の ACCESS_LOST 等でフレームが長時間来ない場合にキャプチャ再初期化を行う閾値
-    constexpr int64_t CAPTURE_STALL_TIMEOUT_MS = 5000;
+    // 静止画面でのフリーズフレーム繰り返し用キャッシュ
+    FrameBuffer freeze_buf;
+    FrameMeta   freeze_meta{};
+    bool        has_freeze = false;
+
+    // 設定 fps に基づくフレーム送信間隔 (μs)
+    const int64_t frame_interval_us = 1000000LL / config_.encoder.fps;
+    time_utils::Stopwatch frame_sw;  // フレーム送信タイマー
 
     while (!stop_requested_.load() &&
            state_machine_.current_state() == PipelineState::STREAMING) {
-        // フレームを取得する
+
+        // DXGI ハードエラー（ACCESS_LOST 等）を検出したら即座に再初期化する
+        // タイムアウト（画面変化なし）とは区別し、静止画面では RECONFIGURING に遷移しない
+        if (frame_pump_->has_backend_error()) {
+            log_->log_error("DXGI_HARD_ERROR",
+                            "DXGI hard error detected for monitor "
+                            + std::to_string(monitor_info_.number)
+                            + ": " + capture_backend_->last_error());
+            if (!state_machine_.transition_to(PipelineState::RECONFIGURING)) {
+                log_->log_error("STATE_TRANSITION_FAILED",
+                                "Cannot transition to RECONFIGURING from STREAMING");
+            }
+            return;
+        }
+
+        // 次のフレーム送信時刻までの残り待機時間を計算する
+        int64_t wait_us = frame_interval_us - frame_sw.elapsed_us();
+        int     wait_ms = (wait_us > 0)
+                          ? std::min(static_cast<int>(wait_us / 1000) + 1,
+                                     config_.capture.frame_timeout_ms * 2)
+                          : 0;
+
         FrameBuffer buf;
         FrameMeta   meta;
-        if (!frame_pump_->wait_pop(buf, meta,
-                                    config_.capture.frame_timeout_ms * 2)) {
-            // フレームが一定時間来ない場合はキャプチャが失速している
-            // (DXGI ACCESS_LOST 等)。RECONFIGURING でキャプチャを再初期化する
-            if (stall_sw.elapsed_ms() >= CAPTURE_STALL_TIMEOUT_MS) {
-                log_->log_error("CAPTURE_STALLED",
-                                "No frames for " + std::to_string(CAPTURE_STALL_TIMEOUT_MS)
-                                + "ms, reinitializing capture for monitor "
-                                + std::to_string(monitor_info_.number));
-                if (!state_machine_.transition_to(PipelineState::RECONFIGURING)) {
-                    log_->log_error("STATE_TRANSITION_FAILED",
-                                    "Cannot transition to RECONFIGURING from STREAMING");
-                }
-                return;
-            }
+        bool got_frame = (wait_ms > 0)
+                         ? frame_pump_->wait_pop(buf, meta, wait_ms)
+                         : frame_pump_->try_pop(buf, meta);
+
+        if (got_frame) {
+            // 新しいフレームを受信: フリーズバッファを更新する
+            freeze_buf  = std::move(buf);
+            freeze_meta = meta;
+            has_freeze  = true;
+            metrics_->increment_frames_received(monitor_info_.number);
+        }
+
+        // 送信間隔に達していなければスキップする（新規フレームも同様）
+        // これにより画面更新が速い場合でも設定 fps を超えて送信しない
+        if (frame_sw.elapsed_us() < frame_interval_us) {
             continue;
         }
-        stall_sw.reset();  // フレーム受信でスタールタイマーをリセットする
 
-        metrics_->increment_frames_received(monitor_info_.number);
+        // フリーズフレームがなければ最初のフレームがまだ来ていない
+        if (!has_freeze) {
+            continue;
+        }
 
-        // 解像度変更が通知されていた場合は RECONFIGURING に遷移する
+        // 送信タイムスタンプを現在時刻に統一する（フリーズフレーム・新規フレーム共通）
+        freeze_meta.timestamp_us = time_utils::system_now_us();
+
+        // フレーム送信タイマーをリセットする
+        frame_sw.reset();
+
+        // 解像度変更通知が来ていれば RECONFIGURING に遷移する
         if (resize_pending_.load()) {
             if (!state_machine_.transition_to(PipelineState::RECONFIGURING)) {
                 log_->log_error("STATE_TRANSITION_FAILED",
@@ -262,12 +302,11 @@ void ScreenPipeline::do_streaming_loop() {
 
         // エンコードする
         std::vector<EncodedPacket> packets;
-        if (!encoder_->encode(buf, meta, packets)) {
+        if (!encoder_->encode(freeze_buf, freeze_meta, packets)) {
             log_->log_error("ENCODER_ENCODE_FAILED",
                             "encode() returned false for monitor "
                             + std::to_string(monitor_info_.number));
             metrics_->increment_frames_dropped(monitor_info_.number);
-            // エンコードエラーは FATAL に遷移する
             if (!state_machine_.transition_to(PipelineState::FATAL)) {
                 log_->log_error("STATE_TRANSITION_FAILED",
                                 "Cannot transition to FATAL after encode failure");
@@ -292,7 +331,6 @@ void ScreenPipeline::do_streaming_loop() {
         }
 
         if (rtsp_error) {
-            // RTSP エラーは再接続を試みる
             if (!state_machine_.transition_to(PipelineState::RECONNECTING)) {
                 log_->log_error("STATE_TRANSITION_FAILED",
                                 "Cannot transition to RECONNECTING");

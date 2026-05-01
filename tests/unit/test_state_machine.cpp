@@ -137,6 +137,30 @@ int run_state_machine_tests() {
     }
 
     {
+        // CONNECTING → FATAL (有効遷移: エンコーダー初期化失敗時に使用)
+        StateMachine sm;
+        sm.transition_to(PipelineState::CAPTURING);
+        sm.transition_to(PipelineState::CONNECTING);
+        bool ok = sm.transition_to(PipelineState::FATAL);
+        VERIFY_MSG(ok, "CONNECTING → FATAL should succeed");
+        VERIFY(sm.current_state() == PipelineState::FATAL);
+        printf("[PASS] CONNECTING → FATAL\n");
+    }
+
+    {
+        // RECONFIGURING → FATAL (有効遷移: DXGI 再初期化失敗時に使用)
+        StateMachine sm;
+        sm.transition_to(PipelineState::CAPTURING);
+        sm.transition_to(PipelineState::CONNECTING);
+        sm.transition_to(PipelineState::STREAMING);
+        sm.transition_to(PipelineState::RECONFIGURING);
+        bool ok = sm.transition_to(PipelineState::FATAL);
+        VERIFY_MSG(ok, "RECONFIGURING → FATAL should succeed");
+        VERIFY(sm.current_state() == PipelineState::FATAL);
+        printf("[PASS] RECONFIGURING → FATAL\n");
+    }
+
+    {
         // 遷移コールバックが正しく発火すること
         StateMachine sm;
         PipelineState cb_from = PipelineState::INIT;

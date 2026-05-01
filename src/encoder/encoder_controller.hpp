@@ -108,6 +108,17 @@ public:
     CodecInfo get_codec_info() const;
 
     /**
+     * @brief 実際に選択されたコーデック名を返す
+     *
+     * フォールバックが発生した場合、config.codec ではなく
+     * 実際に avcodec_open2() に成功したコーデック名を返す。
+     * init() 前は空文字列を返す。
+     *
+     * @return 選択されたコーデック名
+     */
+    const std::string& selected_codec_name() const;
+
+    /**
      * @brief 最初のフレームの壁時計時刻を返す
      *
      * RTSP 再接続時に start_time_realtime を正しく設定するために使用する。

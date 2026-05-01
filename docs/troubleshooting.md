@@ -269,12 +269,12 @@ cat state/metrics.json
 ログは `log_dir` 以下に JSON Lines 形式で出力されます。以下のコマンドで確認できます。
 
 ```bash
-# 最新のログをリアルタイムで表示
-tail -f logs/screen-relay.log | python -m json.tool
+# 最新のログをリアルタイムで表示 (<instance_name> は config.json の app.instance_name)
+tail -f logs/<instance_name>.jsonl | python -m json.tool
 
-# エラーのみ抽出
-grep '"level":"error"' logs/screen-relay.log
+# エラーイベントのみ抽出
+grep '"event":"error"' logs/<instance_name>.jsonl
 
 # 特定モニターのイベントを抽出
-grep '"monitor":1' logs/screen-relay.log
+grep '"monitor":"1"' logs/<instance_name>.jsonl
 ```

@@ -162,12 +162,13 @@ bool ScreenPipeline::do_connect() {
         return false;
     }
 
+    const std::string& actual_codec = encoder_->selected_codec_name();
     log_->log_encoder_initialized(monitor_info_.number,
-                                   config_.encoder.codec,
+                                   actual_codec,
                                    current_width_, current_height_,
                                    config_.encoder.fps,
                                    config_.encoder.bitrate_kbps);
-    metrics_->set_encoder_codec(monitor_info_.number, config_.encoder.codec);
+    metrics_->set_encoder_codec(monitor_info_.number, actual_codec);
 
     // RTSP クライアントを接続する
     auto codec_info = encoder_->get_codec_info();

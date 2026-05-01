@@ -281,6 +281,10 @@ int64_t EncoderController::first_frame_time_us() const {
     return impl_->first_frame_time_us_;
 }
 
+const std::string& EncoderController::selected_codec_name() const {
+    return impl_->codec_name;
+}
+
 EncoderController::CodecInfo EncoderController::get_codec_info() const {
     CodecInfo ci;
     if (!impl_->codec_ctx) return ci;

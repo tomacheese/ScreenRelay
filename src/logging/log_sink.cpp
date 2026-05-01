@@ -2,6 +2,7 @@
 #include "common/time_utils.hpp"
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
+#include <cstdio>
 #include <filesystem>
 #include <sstream>
 
@@ -65,14 +66,25 @@ bool LogSink::init(const std::string& log_dir,
 static std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size());
-    for (char c : s) {
+    for (unsigned char c : s) {
         switch (c) {
             case '"':  out += "\\\""; break;
             case '\\': out += "\\\\"; break;
+            case '\b': out += "\\b";  break;
+            case '\f': out += "\\f";  break;
             case '\n': out += "\\n";  break;
             case '\r': out += "\\r";  break;
             case '\t': out += "\\t";  break;
-            default:   out += c;      break;
+            default:
+                if (c < 0x20) {
+                    // JSON 仕様に従い制御文字を \uXXXX でエスケープする
+                    char buf[7];
+                    snprintf(buf, sizeof(buf), "\\u%04x", c);
+                    out += buf;
+                } else {
+                    out += static_cast<char>(c);
+                }
+                break;
         }
     }
     return out;

@@ -4,7 +4,7 @@
 
 | ツール | バージョン | 備考 |
 |---|---|---|
-| GCC (MinGW-w64) | 15.2.0 以上 | `gcc --version` で確認 |
+| GCC (MinGW-w64) | 13.0 以上（15.x 推奨） | `gcc --version` で確認 |
 | CMake | 3.25 以上 | `cmake --version` で確認 |
 | Ninja | 1.11 以上 | `ninja --version` で確認 |
 | FFmpeg | LGPL shared ビルド | 後述の配置手順を参照 |
@@ -150,7 +150,7 @@ FFmpeg の `lib/` ディレクトリが正しく配置されているか確認�
 
 ### `cc1: error: unrecognized command-line option` が出る
 
-MinGW-w64 のバージョンが古い可能性があります。GCC 15.2.0 以上を使用してください。
+MinGW-w64 のバージョンが古い可能性があります。GCC 13.0 以上（15.x 推奨）を使用してください。
 
 ### Ninja が見つからないと言われる
 

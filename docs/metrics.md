@@ -95,21 +95,16 @@
 
 ## イベントログ（JSON Lines）
 
-ログファイルは `log_dir` に JSON Lines 形式で出力されます。各行が 1 件のイベントです。
+ログファイルは `log_dir` に `<instance_name>.jsonl` として JSON Lines 形式で出力されます。各行が 1 件のイベントです。
+
+フィールドはすべて文字列値として出力されます（数値・boolean を含む）。
 
 ### state_changed
 
 ステートマシンの状態が変化したときに記録されます。
 
 ```json
-{
-  "ts": "2026-04-30T19:21:03.000Z",
-  "level": "info",
-  "event": "state_changed",
-  "monitor": 1,
-  "from": "CONNECTING",
-  "to": "STREAMING"
-}
+{"ts":"2026-04-30T19:21:03.000Z","event":"state_changed","from":"CONNECTING","monitor":"1","to":"STREAMING"}
 ```
 
 ### monitor_added
@@ -117,15 +112,7 @@
 新しいモニターが検出されたときに記録されます。
 
 ```json
-{
-  "ts": "2026-04-30T19:21:00.000Z",
-  "level": "info",
-  "event": "monitor_added",
-  "monitor": 2,
-  "width": 1280,
-  "height": 1024,
-  "primary": false
-}
+{"ts":"2026-04-30T19:21:00.000Z","event":"monitor_added","device":"\\\\.\\DISPLAY2","height":"1024","is_primary":"false","monitor":"2","width":"1280"}
 ```
 
 ### monitor_removed
@@ -133,27 +120,15 @@
 モニターが取り外されたときに記録されます。
 
 ```json
-{
-  "ts": "2026-04-30T19:25:00.000Z",
-  "level": "info",
-  "event": "monitor_removed",
-  "monitor": 2
-}
+{"ts":"2026-04-30T19:25:00.000Z","event":"monitor_removed","monitor":"2"}
 ```
 
 ### encoder_initialized
 
-エンコーダーが初期化されたときに記録されます。フォールバックが発生した場合は試行したコーデック一覧も記録されます。
+エンコーダーが初期化されたときに記録されます。`codec` には実際に選択されたコーデック名が入ります（フォールバックが発生した場合は設定値と異なる場合があります）。
 
 ```json
-{
-  "ts": "2026-04-30T19:21:01.000Z",
-  "level": "info",
-  "event": "encoder_initialized",
-  "monitor": 1,
-  "codec": "h264_mf",
-  "tried": ["h264_nvenc", "h264_mf"]
-}
+{"ts":"2026-04-30T19:21:01.000Z","event":"encoder_initialized","bitrate_kbps":"5000","codec":"h264_mf","fps":"60","height":"1080","monitor":"1","width":"1920"}
 ```
 
 ### publish_started
@@ -161,13 +136,7 @@
 RTSP 配信が開始されたときに記録されます。
 
 ```json
-{
-  "ts": "2026-04-30T19:21:02.000Z",
-  "level": "info",
-  "event": "publish_started",
-  "monitor": 1,
-  "url": "rtsp://192.168.0.100:8554/screen1"
-}
+{"ts":"2026-04-30T19:21:02.000Z","event":"publish_started","fps":"60","height":"1080","monitor":"1","url":"rtsp://192.168.0.100:8554/screen1","width":"1920"}
 ```
 
 ### error
@@ -175,14 +144,7 @@ RTSP 配信が開始されたときに記録されます。
 エラーが発生したときに記録されます。
 
 ```json
-{
-  "ts": "2026-04-30T19:30:00.000Z",
-  "level": "error",
-  "event": "error",
-  "monitor": 1,
-  "code": "RTSP_SEND_FAILED",
-  "message": "av_interleaved_write_frame failed: Broken pipe"
-}
+{"ts":"2026-04-30T19:30:00.000Z","event":"error","code":"RTSP_SEND_FAILED","message":"av_interleaved_write_frame failed: Broken pipe","monitor":"1","url":"rtsp://..."}
 ```
 
 ---

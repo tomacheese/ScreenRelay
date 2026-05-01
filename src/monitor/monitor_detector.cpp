@@ -43,7 +43,7 @@ static BOOL CALLBACK monitor_enum_callback(HMONITOR hmon, HDC /*hdc*/, LPRECT /*
             WideCharToMultiByte(
                 CP_UTF8, 0,
                 info.szDevice, -1,
-                device_name.data(), len,
+                device_name.data(), len - 1,  // null 終端を除いた長さを渡す
                 nullptr, nullptr
             );
         }
@@ -148,7 +148,7 @@ bool MonitorDetector::is_mirror_driver(const std::string& device_name) {
             MultiByteToWideChar(
                 CP_UTF8, 0,
                 device_name.c_str(), -1,
-                wname.data(), len
+                wname.data(), len - 1  // null 終端を除いた長さを渡す
             );
         }
     }

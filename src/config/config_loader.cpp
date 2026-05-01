@@ -121,9 +121,15 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
         return false;
     }
 
-    // キャプチャタイムアウトの正値チェック
-    if (out.capture.frame_timeout_ms <= 0) {
-        error = "capture.frame_timeout_ms must be positive";
+    // キャプチャバックエンドのチェック (現時点では "dxgi" のみ実装)
+    if (out.capture.backend != "dxgi") {
+        error = "capture.backend must be \"dxgi\" (only dxgi is currently supported)";
+        return false;
+    }
+
+    // キャプチャタイムアウトの非負チェック (0 は即時返却)
+    if (out.capture.frame_timeout_ms < 0) {
+        error = "capture.frame_timeout_ms must be 0 or positive";
         return false;
     }
 

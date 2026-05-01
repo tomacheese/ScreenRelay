@@ -38,9 +38,20 @@ void FramePump::start(ICaptureBackend* backend, int frame_timeout_ms) {
         return;
     }
 
+    if (!backend) {
+        return;
+    }
+
     backend_          = backend;
     frame_timeout_ms_ = frame_timeout_ms;
     running_.store(true);
+
+    // 再起動時に残留した古い解像度のフレームをクリアする
+    {
+        std::lock_guard<std::mutex> lk(mutex_);
+        while (!queue_.empty()) queue_.pop();
+        frame_seq_ = 0;
+    }
 
     thread_ = std::thread(&FramePump::capture_thread_func, this);
 }

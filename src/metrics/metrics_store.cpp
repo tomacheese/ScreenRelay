@@ -9,7 +9,8 @@
 using json = nlohmann::json;
 namespace fs = std::filesystem;
 
-MetricsStore::MetricsStore() = default;
+MetricsStore::MetricsStore()
+    : session_start_ms_(time_utils::system_now_ms()) {}
 
 MetricsStore::MonitorStats& MetricsStore::get_stats(int monitor_number) {
     // マップに存在しない場合はデフォルト構築される

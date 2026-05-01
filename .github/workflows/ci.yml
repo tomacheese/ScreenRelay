@@ -54,14 +54,47 @@ jobs:
           custom_release_rules: "feat:minor:✨ Features,fix:patch:🐛 Fixes,docs:patch:📰 Docs,chore:patch:🎨 Chore,pref:patch:🎈 Performance improvements,refactor:patch:🧹 Refactoring,build:patch:🔍 Build,ci:patch:🔍 CI,revert:patch:⏪ Revert,style:patch:🧹 Style,test:patch:👀 Test,release:major:📦 Release"
           dry_run: ${{ github.event.pull_request.merged == true && 'false' || 'true' }}
 
+  post-approval-request:
+    name: 📢 Request fork PR approval
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'pull_request_target' &&
+      github.event.pull_request.head.repo.full_name != github.repository &&
+      (github.event.action == 'opened' || github.event.action == 'reopened')
+    permissions:
+      pull-requests: write
+    steps:
+      - name: 📝 Post approval request comment
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr comment ${{ github.event.pull_request.number }} \
+            --repo '${{ github.repository }}' \
+            --body '⚠️ **このフォーク PR はビルド承認が必要です**
+
+          リポジトリのメンテナーが **`fork-pr-build`** Environment を承認するまで、ビルドは開始されません。
+
+          Actions タブで当該ワークフローを開き、承認を行ってください。'
+
+  approval-gate:
+    name: 🔐 Fork PR approval gate
+    runs-on: ubuntu-latest
+    # フォーク PR (非 closed) のみ fork-pr-build environment を要求し、それ以外は空文字で即通過
+    environment: ${{ (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository && github.event.action != 'closed') && 'fork-pr-build' || '' }}
+    steps:
+      - name: Approved
+        run: echo "Build approved"
+
   cpp-build:
     name: 🏗️ Build & Test (Windows / MinGW64)
     runs-on: windows-latest
     needs:
       - calc-version
+      - approval-gate
     if: >-
       always() &&
       (needs.calc-version.result == 'success' || needs.calc-version.result == 'skipped') &&
+      (needs.approval-gate.result == 'success' || needs.approval-gate.result == 'skipped') &&
       (github.event.action != 'closed' || github.event.pull_request.merged == true)
     permissions:
       contents: write
@@ -177,17 +210,24 @@ jobs:
     if: always()
     needs:
       - calc-version
+      - approval-gate
       - cpp-build
 
     steps:
       - name: 🔍 Check build status
         run: |
           calc_result="${{ needs.calc-version.result }}"
+          approval_result="${{ needs.approval-gate.result }}"
           build_result="${{ needs.cpp-build.result }}"
           echo "calc-version: $calc_result"
+          echo "approval-gate: $approval_result"
           echo "cpp-build: $build_result"
           if [ "$calc_result" != "success" ] && [ "$calc_result" != "skipped" ]; then
             echo "Version calculation failed"
+            exit 1
+          fi
+          if [ "$approval_result" != "success" ] && [ "$approval_result" != "skipped" ]; then
+            echo "Fork PR build rejected or timed out"
             exit 1
           fi
           if [ "$build_result" != "success" ] && [ "$build_result" != "skipped" ]; then

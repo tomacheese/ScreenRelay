@@ -80,21 +80,36 @@ std::vector<std::string> ScreenPipeline::make_rtsp_urls() const {
  * 失敗した場合は FATAL ステートに遷移して false を返す。
  */
 bool ScreenPipeline::do_init_and_capture() {
-    // DXGI キャプチャバックエンドを初期化する
+    // DXGI キャプチャバックエンドを初期化する。
+    // 解像度変更直後や GPU を共有する別モニターの RECONFIGURING と競合した場合、
+    // DuplicateOutput が E_ACCESSDENIED を返すことがある。
+    // do_reconfigure() と同様に 200ms 間隔で最大 15 回リトライする。
     auto backend = std::make_unique<DxgiCaptureBackend>();
-    if (!backend->init(monitor_info_.handle,
-                       monitor_info_.logical_width,
-                       monitor_info_.logical_height)) {
-        log_->log_error("DXGI_INIT_FAILED",
-                        "DxgiCaptureBackend::init failed for monitor "
-                        + std::to_string(monitor_info_.number)
-                        + ": " + backend->last_error());
-        if (!state_machine_.transition_to(PipelineState::FATAL)) {
-            log_->log_error("STATE_TRANSITION_FAILED",
-                            "Cannot transition to FATAL from "
-                            + std::string(state_name(state_machine_.current_state())));
+    {
+        constexpr int kMaxRetries   = 15;
+        constexpr int kRetryDelayMs = 200;
+        bool init_ok = false;
+        for (int retry = 0; retry < kMaxRetries && !stop_requested_.load(); ++retry) {
+            if (retry > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
+            }
+            init_ok = backend->init(monitor_info_.handle,
+                                    monitor_info_.logical_width,
+                                    monitor_info_.logical_height);
+            if (init_ok) break;
         }
-        return false;
+        if (!init_ok) {
+            log_->log_error("DXGI_INIT_FAILED",
+                            "DxgiCaptureBackend::init failed for monitor "
+                            + std::to_string(monitor_info_.number)
+                            + ": " + backend->last_error());
+            if (!state_machine_.transition_to(PipelineState::FATAL)) {
+                log_->log_error("STATE_TRANSITION_FAILED",
+                                "Cannot transition to FATAL from "
+                                + std::string(state_name(state_machine_.current_state())));
+            }
+            return false;
+        }
     }
     capture_backend_ = std::move(backend);
 
@@ -506,12 +521,32 @@ void ScreenPipeline::do_reconfigure() {
     int new_h = had_resize ? pending.height : current_height_;
 
     // DXGI バックエンドを完全に再初期化する (ACCESS_LOST 後の回復を含む)
+    //
+    // 解像度変更直後は Windows のディスプレイドライバーが構成を更新中であり、
+    // DuplicateOutput が E_ACCESSDENIED (0x80070005) を返すことがある。
+    // 同じ GPU を共有する全モニターが同時に RECONFIGURING に入る場合も同様。
+    // 致命的エラーと判断する前に 200ms 間隔で最大 15 回リトライする
+    // (最大待機 3s。通常 1～2 回目のリトライで成功する)。
     if (capture_backend_) {
         capture_backend_->release();
-        if (!capture_backend_->init(monitor_info_.handle, new_w, new_h)) {
+
+        constexpr int   kMaxRetries    = 15;
+        constexpr int   kRetryDelayMs  = 200;
+        bool init_ok = false;
+
+        for (int retry = 0; retry < kMaxRetries && !stop_requested_.load(); ++retry) {
+            if (retry > 0) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
+            }
+            init_ok = capture_backend_->init(monitor_info_.handle, new_w, new_h);
+            if (init_ok) break;
+        }
+
+        if (!init_ok) {
             log_->log_error("DXGI_REINIT_FAILED",
                             "Failed to reinit DXGI for monitor "
                             + std::to_string(monitor_info_.number)
+                            + " (retried " + std::to_string(kMaxRetries) + " times)"
                             + ": " + capture_backend_->last_error());
             if (!state_machine_.transition_to(PipelineState::FATAL)) {
                 log_->log_error("STATE_TRANSITION_FAILED",

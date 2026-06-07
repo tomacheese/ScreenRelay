@@ -226,6 +226,8 @@ static bool try_init_gpu_zero_copy(const AVCodec* codec, ID3D11Device* shared_de
     AVDictionary* opts = nullptr;
     if (!config.preset.empty())
         av_dict_set(&opts, "preset", config.preset.c_str(), 0);
+    if (!config.tune.empty())
+        av_dict_set(&opts, "tune", config.tune.c_str(), 0);
     // NVENC 低遅延設定 (CPU パスの h264_nvenc 設定と同一)
     av_dict_set(&opts, "rc", "cbr", 0);
     av_dict_set(&opts, "delay", "0", 0);

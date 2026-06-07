@@ -40,6 +40,8 @@ struct EncoderController::Impl {
     AVFrame*     hw_frame             = nullptr;  ///< プールから取得する再利用可能なハードウェアフレーム
     bool         gpu_zero_copy_active = false;    ///< GPU ゼロコピーパスが確立されているか
 
+    bool         force_next_idr       = false;    ///< 次フレームを IDR として強制出力するフラグ
+
     /**
      * @brief 次に送信するフレームの PTS を計算し、内部カウンターを更新する
      *
@@ -58,6 +60,21 @@ struct EncoderController::Impl {
         }
         int64_t elapsed_us = meta.timestamp_us - first_frame_time_us_;
         int64_t new_pts    = elapsed_us * static_cast<int64_t>(fps) / 1000000LL;
+
+        // RTP タイムスタンプ 32-bit オーバーフロー防止。
+        // RTP_ts = PTS * 90000 / fps であり、PTS が 0xFFFFFFFF * fps / 90000 に
+        // 達すると RTP タイムスタンプが uint32_t をオーバーフローする
+        // (60fps では約 13.3 時間)。オーバーフロー直前でリセットし、
+        // 接続中クライアントへの影響を最小化する（RTP 仕様上、タイムスタンプの
+        // ラップアラウンドは許容されており RFC 3550 準拠クライアントは処理できる）。
+        constexpr int64_t kRtpClock  = 90000LL;
+        const     int64_t kPtsWrapAt = static_cast<int64_t>(0xFFFFFFFFLL) * fps / kRtpClock;
+        if (new_pts >= kPtsWrapAt) {
+            first_frame_time_us_ = meta.timestamp_us;
+            last_pts_            = -1;
+            new_pts              = 0;
+        }
+
         if (new_pts <= last_pts_) new_pts = last_pts_ + 1;
         last_pts_ = new_pts;
         frame_count++;
@@ -516,6 +533,12 @@ bool EncoderController::encode(const FrameBuffer& frame,
 
     impl_->yuv_frame->pts = impl_->compute_next_pts(meta, config_.fps);
 
+    // IDR 強制フラグが立っている場合はキーフレームを要求し、フラグを消費する。
+    // RTSP 再接続後に即座に完全フレームが届くようにするため。
+    impl_->yuv_frame->pict_type = impl_->force_next_idr
+        ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    impl_->force_next_idr = false;
+
     int ret = avcodec_send_frame(impl_->codec_ctx, impl_->yuv_frame);
     if (ret < 0) return false;
 
@@ -584,6 +607,11 @@ bool EncoderController::encode_gpu_zero_copy(const FrameBuffer& frame,
         // 直接 GPU テクスチャへアップロードしてエンコードする
         // （sw_format=BGRA のため sws_scale による色空間変換は不要）。
         UINT row_pitch = static_cast<UINT>(frame.width) * 4;
+        if (row_pitch == 0) {
+            // width=0 の不正フレームは UpdateSubresource に渡さず早期リターン
+            if (d3d11_hwctx->unlock) d3d11_hwctx->unlock(d3d11_hwctx->lock_ctx);
+            return false;
+        }
         d3d11_hwctx->device_context->UpdateSubresource(
             dst_tex, dst_idx, nullptr, frame.data.data(), row_pitch, 0);
     } else {
@@ -593,6 +621,13 @@ bool EncoderController::encode_gpu_zero_copy(const FrameBuffer& frame,
     if (d3d11_hwctx->unlock) d3d11_hwctx->unlock(d3d11_hwctx->lock_ctx);
 
     impl_->hw_frame->pts = impl_->compute_next_pts(meta, config_.fps);
+
+    // IDR 強制フラグが立っている場合はキーフレームを要求し、フラグを消費する。
+    // av_hwframe_get_buffer() 後の hw_frame は既に pict_type = NONE にリセット
+    // されているが、明示的に設定することで意図を明確にする。
+    impl_->hw_frame->pict_type = impl_->force_next_idr
+        ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;
+    impl_->force_next_idr = false;
 
     ret = avcodec_send_frame(impl_->codec_ctx, impl_->hw_frame);
     if (ret < 0) return false;
@@ -621,8 +656,13 @@ void EncoderController::reset() {
     impl_->codec                = nullptr;
     impl_->codec_name.clear();
     impl_->gpu_zero_copy_active = false;
+    impl_->force_next_idr       = false;
     width_  = 0;
     height_ = 0;
+}
+
+void EncoderController::request_next_idr() {
+    impl_->force_next_idr = true;
 }
 
 int EncoderController::fps() const {

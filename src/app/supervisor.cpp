@@ -53,6 +53,25 @@ void ScreenPipeline::notify_resized(int new_width, int new_height) {
 }
 
 /**
+ * @brief DXGI キャプチャバックエンドをリトライ付きで初期化する
+ *
+ * do_init_and_capture() / do_reconfigure() で共用する共通ヘルパー。
+ * 200ms 間隔で最大 15 回リトライし、stop_requested_ が立てば途中で打ち切る。
+ */
+bool ScreenPipeline::init_capture_with_retry(ICaptureBackend* backend,
+                                               int width, int height) {
+    constexpr int kMaxRetries   = 15;
+    constexpr int kRetryDelayMs = 200;
+    for (int retry = 0; retry < kMaxRetries && !stop_requested_.load(); ++retry) {
+        if (retry > 0)
+            std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
+        if (backend->init(monitor_info_.handle, width, height))
+            return true;
+    }
+    return false;
+}
+
+/**
  * @brief RTSP URL を生成する
  *
  * path_pattern 内の {n} をモニター番号に置換する。
@@ -85,31 +104,19 @@ bool ScreenPipeline::do_init_and_capture() {
     // DuplicateOutput が E_ACCESSDENIED を返すことがある。
     // do_reconfigure() と同様に 200ms 間隔で最大 15 回リトライする。
     auto backend = std::make_unique<DxgiCaptureBackend>();
-    {
-        constexpr int kMaxRetries   = 15;
-        constexpr int kRetryDelayMs = 200;
-        bool init_ok = false;
-        for (int retry = 0; retry < kMaxRetries && !stop_requested_.load(); ++retry) {
-            if (retry > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
-            }
-            init_ok = backend->init(monitor_info_.handle,
-                                    monitor_info_.logical_width,
-                                    monitor_info_.logical_height);
-            if (init_ok) break;
+    if (!init_capture_with_retry(backend.get(),
+                                  monitor_info_.logical_width,
+                                  monitor_info_.logical_height)) {
+        log_->log_error("DXGI_INIT_FAILED",
+                        "DxgiCaptureBackend::init failed for monitor "
+                        + std::to_string(monitor_info_.number)
+                        + ": " + backend->last_error());
+        if (!state_machine_.transition_to(PipelineState::FATAL)) {
+            log_->log_error("STATE_TRANSITION_FAILED",
+                            "Cannot transition to FATAL from "
+                            + std::string(state_name(state_machine_.current_state())));
         }
-        if (!init_ok) {
-            log_->log_error("DXGI_INIT_FAILED",
-                            "DxgiCaptureBackend::init failed for monitor "
-                            + std::to_string(monitor_info_.number)
-                            + ": " + backend->last_error());
-            if (!state_machine_.transition_to(PipelineState::FATAL)) {
-                log_->log_error("STATE_TRANSITION_FAILED",
-                                "Cannot transition to FATAL from "
-                                + std::string(state_name(state_machine_.current_state())));
-            }
-            return false;
-        }
+        return false;
     }
     capture_backend_ = std::move(backend);
 
@@ -414,6 +421,19 @@ void ScreenPipeline::do_streaming_loop() {
             }
         }
     }
+
+    // RECONNECT (STREAMING → RECONNECTING → STREAMING) 後に再び do_streaming_loop() が
+    // 呼ばれると initial_frame_buf_ は空（最初の呼び出しで std::move 済み）のため、
+    // GPU ゼロコピーモード中に静止画面のモニターでは DXGI が新規フレームを
+    // 返さず has_freeze = false のままストリームが真っ暗になる。
+    // ループ終了時に最後のフリーズフレームを保存しておくことで次回呼び出し時に
+    // 即座に送信できる状態にする。
+    // ※ GPU テクスチャを含む場合は do_reconfigure() でクリアすること
+    //    （D3D11 デバイス解放後に古いテクスチャを参照し続けるのを防ぐため）。
+    if (has_freeze) {
+        initial_frame_buf_  = std::move(freeze_buf);
+        initial_frame_meta_ = freeze_meta;
+    }
 }
 
 /**
@@ -473,6 +493,10 @@ void ScreenPipeline::do_reconnect() {
                 log_->log_error("STATE_TRANSITION_FAILED",
                                 "Cannot transition to STREAMING after reconnect");
             }
+            // 再接続直後の最初のフレームを IDR として送出する。
+            // エンコーダーをリセットせず GOP 内に挿入するため PTS の連続性は保たれる。
+            // これにより接続直後から受信側が黒画面なく映像を表示できる。
+            encoder_->request_next_idr();
             return;
         }
     }
@@ -494,6 +518,13 @@ void ScreenPipeline::do_reconnect() {
 void ScreenPipeline::do_reconfigure() {
     // フレームポンプを一時停止する
     if (frame_pump_) frame_pump_->stop();
+
+    // D3D11 デバイス解放前に GPU テクスチャ参照を含む初期フレームバッファを
+    // クリアする。do_streaming_loop() 終了時に保存された freeze_buf が
+    // GPU テクスチャを持つ場合、ここでクリアしないと capture_backend_->release()
+    // 後も古いデバイスのテクスチャが参照され続けることになる。
+    initial_frame_buf_  = FrameBuffer{};
+    initial_frame_meta_ = {};
 
     // 接続中のクライアントがあれば停止を1回だけ記録して解放する
     bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
@@ -525,28 +556,15 @@ void ScreenPipeline::do_reconfigure() {
     // 解像度変更直後は Windows のディスプレイドライバーが構成を更新中であり、
     // DuplicateOutput が E_ACCESSDENIED (0x80070005) を返すことがある。
     // 同じ GPU を共有する全モニターが同時に RECONFIGURING に入る場合も同様。
-    // 致命的エラーと判断する前に 200ms 間隔で最大 15 回リトライする
+    // 致命的エラーと判断する前に init_capture_with_retry() で最大 15 回リトライする
     // (最大待機 3s。通常 1～2 回目のリトライで成功する)。
     if (capture_backend_) {
         capture_backend_->release();
 
-        constexpr int   kMaxRetries    = 15;
-        constexpr int   kRetryDelayMs  = 200;
-        bool init_ok = false;
-
-        for (int retry = 0; retry < kMaxRetries && !stop_requested_.load(); ++retry) {
-            if (retry > 0) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(kRetryDelayMs));
-            }
-            init_ok = capture_backend_->init(monitor_info_.handle, new_w, new_h);
-            if (init_ok) break;
-        }
-
-        if (!init_ok) {
+        if (!init_capture_with_retry(capture_backend_.get(), new_w, new_h)) {
             log_->log_error("DXGI_REINIT_FAILED",
                             "Failed to reinit DXGI for monitor "
                             + std::to_string(monitor_info_.number)
-                            + " (retried " + std::to_string(kMaxRetries) + " times)"
                             + ": " + capture_backend_->last_error());
             if (!state_machine_.transition_to(PipelineState::FATAL)) {
                 log_->log_error("STATE_TRANSITION_FAILED",
@@ -560,9 +578,21 @@ void ScreenPipeline::do_reconfigure() {
     current_height_ = new_h;
     metrics_->set_resolution(monitor_info_.number, current_width_, current_height_);
 
-    // FramePump を再開する
+    // FramePump を再開して最初のフレームを待つ。
+    // DXGI は新規の DuplicateOutput 直後の最初の AcquireNextFrame で
+    // 必ず現在のデスクトップフレームを返す（画面変化がなくても）。
+    // これを初期フリーズフレームとして保存することで do_streaming_loop() の
+    // 起動直後から映像が届くようにする（アイドルモニターで最大 24 秒かかる
+    // GPU ゼロコピーモード下での次フレーム到着を待たずに済む）。
     if (frame_pump_ && capture_backend_) {
         frame_pump_->start(capture_backend_.get(), config_.capture.frame_timeout_ms);
+
+        FrameBuffer seed_fb;
+        FrameMeta   seed_meta;
+        if (frame_pump_->wait_pop(seed_fb, seed_meta, config_.capture.frame_timeout_ms)) {
+            initial_frame_buf_  = std::move(seed_fb);
+            initial_frame_meta_ = seed_meta;
+        }
     }
 
     // CAPTURING に戻す。次のループで do_connect() が呼ばれる
@@ -580,6 +610,15 @@ void ScreenPipeline::do_reconfigure() {
  * @brief すべてのパイプラインリソースを解放する
  */
 void ScreenPipeline::teardown_all() {
+    // GPU テクスチャを含む初期フレームバッファを D3D11 デバイス解放前にクリアする。
+    // 通常フローでは do_reconfigure() がクリア済みだが、stop_requested_ が
+    // RECONFIGURING ステート中に立った場合、do_reconfigure() の実行前に
+    // pipeline_thread_func が停止条件を満たして teardown_all() を呼ぶことがある。
+    // そのまま capture_backend_->release() を呼ぶと、古い D3D11 デバイスへの
+    // GPU テクスチャ参照が残り use-after-free になるため、ここで確実にクリアする。
+    initial_frame_buf_  = FrameBuffer{};
+    initial_frame_meta_ = {};
+
     if (frame_pump_) {
         frame_pump_->stop();
         frame_pump_.reset();

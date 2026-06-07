@@ -170,6 +170,16 @@ public:
      */
     int64_t first_frame_time_us() const;
 
+    /**
+     * @brief 次のフレームを IDR (キーフレーム) として強制出力するよう要求する
+     *
+     * RTSP 再接続後に呼び出すことで、接続直後から受信側が完全な映像を
+     * 表示できるようにする。エンコーダーをリセットせず GOP 内に IDR を
+     * 挿入するため、PTS の連続性（RTCP SR との整合性）は保たれる。
+     * 一度消費されると次の encode() 呼び出しでフラグはリセットされる。
+     */
+    void request_next_idr();
+
 private:
     /**
      * @brief GPU ゼロコピーパスでフレームをエンコードする

@@ -232,6 +232,13 @@ void ScreenPipeline::do_streaming_loop() {
     FrameMeta   freeze_meta{};
     bool        has_freeze = false;
 
+    // 直前に encode() したフレームからピクセル内容が変化しているか。
+    // DXGI Desktop Duplication は画面に変化があった場合のみ新規フレームを
+    // 返すため、新規フレームを受信した時点で true にする。フリーズフレーム
+    // （新規フレームなし）の再送時は内容が同一なので false のまま encode() に
+    // 渡し、sws_scale による色空間変換コストを省略させる。
+    bool content_changed = true;
+
     // 設定 fps に基づくフレーム送信間隔 (μs)
     const int64_t frame_interval_us = 1000000LL / config_.encoder.fps;
     time_utils::Stopwatch frame_sw;  // フレーム送信タイマー
@@ -268,9 +275,10 @@ void ScreenPipeline::do_streaming_loop() {
 
         if (got_frame) {
             // 新しいフレームを受信: フリーズバッファを更新する
-            freeze_buf  = std::move(buf);
-            freeze_meta = meta;
-            has_freeze  = true;
+            freeze_buf       = std::move(buf);
+            freeze_meta      = meta;
+            has_freeze       = true;
+            content_changed  = true;
             metrics_->increment_frames_received(monitor_info_.number);
         }
 
@@ -300,9 +308,10 @@ void ScreenPipeline::do_streaming_loop() {
             break;
         }
 
-        // エンコードする
+        // エンコードする。content_changed が false の場合、エンコーダー側で
+        // sws_scale をスキップして直前の変換結果を再利用する（CPU 負荷削減）
         std::vector<EncodedPacket> packets;
-        if (!encoder_->encode(freeze_buf, freeze_meta, packets)) {
+        if (!encoder_->encode(freeze_buf, freeze_meta, packets, content_changed)) {
             log_->log_error("ENCODER_ENCODE_FAILED",
                             "encode() returned false for monitor "
                             + std::to_string(monitor_info_.number));
@@ -313,6 +322,9 @@ void ScreenPipeline::do_streaming_loop() {
             }
             break;
         }
+        // 変換済み YUV フレームは消費されたので、次に新規フレームを受信するまでは
+        // 内容が変化していない（再変換不要）
+        content_changed = false;
 
         // 全 RTSP クライアントにパケットを送信する
         bool rtsp_error = false;

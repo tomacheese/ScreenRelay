@@ -214,19 +214,31 @@ static bool drain_encoder(AVCodecContext* ctx, AVPacket* pkt,
 
 bool EncoderController::encode(const FrameBuffer& frame,
                                 const FrameMeta& meta,
-                                std::vector<EncodedPacket>& out_packets) {
+                                std::vector<EncodedPacket>& out_packets,
+                                bool content_changed) {
     if (!impl_->codec_ctx || !impl_->sws_ctx || !impl_->yuv_frame) return false;
 
-    // BGRA → コーデックのピクセルフォーマットに変換する (DXGI は BGRA で出力)
-    const uint8_t* in_data[1]  = { frame.data.data() };
-    int            in_stride[1] = { static_cast<int>(frame.width) * 4 };
+    // ピクセル内容が変化している場合のみ BGRA → コーデックのピクセルフォーマット
+    // 変換 (sws_scale) を行う。
+    //
+    // 静止画面のフリーズフレーム再送 (do_streaming_loop 参照) では同一の
+    // BGRA データを設定 fps で繰り返しエンコードするが、変換結果も毎回同一になる。
+    // sws_scale は解像度に比例した CPU コストがかかり（4K で約 12ms/フレーム、
+    // 60fps 時に 1 コアの 7 割以上を占有する実測値あり）、これを毎フレーム
+    // 繰り返すのは純粋な無駄である。直前の変換済み YUV フレームをそのまま
+    // 再利用することで、エンコーダーへは新しい PTS でフレームを送り続けつつ
+    // 変換コストを排除する。
+    if (content_changed || impl_->frame_count == 0) {
+        const uint8_t* in_data[1]  = { frame.data.data() };
+        int            in_stride[1] = { static_cast<int>(frame.width) * 4 };
 
-    int make_writable_ret = av_frame_make_writable(impl_->yuv_frame);
-    if (make_writable_ret < 0) return false;
+        int make_writable_ret = av_frame_make_writable(impl_->yuv_frame);
+        if (make_writable_ret < 0) return false;
 
-    sws_scale(impl_->sws_ctx,
-              in_data, in_stride, 0, static_cast<int>(frame.height),
-              impl_->yuv_frame->data, impl_->yuv_frame->linesize);
+        sws_scale(impl_->sws_ctx,
+                  in_data, in_stride, 0, static_cast<int>(frame.height),
+                  impl_->yuv_frame->data, impl_->yuv_frame->linesize);
+    }
 
     // 最初のフレームの壁時計時刻を基点として PTS を計算する。
     // frame_count++ による固定間隔仮定ではなく実キャプチャ間隔を反映させることで

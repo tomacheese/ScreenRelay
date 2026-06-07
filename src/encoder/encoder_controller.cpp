@@ -1,11 +1,16 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <windows.h>
+#include <d3d11.h>
+#include <d3d10.h>  // ID3D10Multithread (NVENC が要求するマルチスレッド保護の有効化に使用)
 
 extern "C" {
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <libavutil/opt.h>
 #include <libavutil/imgutils.h>
+#include <libavutil/hwcontext.h>
+#include <libavutil/hwcontext_d3d11va.h>
 #include <libswscale/swscale.h>
 }
 
@@ -28,6 +33,36 @@ struct EncoderController::Impl {
     int64_t         first_frame_time_us_ = 0;  ///< 最初のフレームの壁時計時刻 (μs, UNIX エポック起点)
     int64_t         last_pts_            = -1; ///< 直前フレームの PTS (単調増加を保証するために使用)
     std::string     codec_name;            ///< 選択されたコーデック名
+
+    // --- GPU ゼロコピーパス (D3D11VA ハードウェアフレーム) 関連 ---
+    AVBufferRef* hw_device_ctx        = nullptr;  ///< D3D11VA ハードウェアデバイスコンテキスト
+    AVBufferRef* hw_frames_ctx        = nullptr;  ///< D3D11VA ハードウェアフレームコンテキスト (BGRA テクスチャプール)
+    AVFrame*     hw_frame             = nullptr;  ///< プールから取得する再利用可能なハードウェアフレーム
+    bool         gpu_zero_copy_active = false;    ///< GPU ゼロコピーパスが確立されているか
+
+    /**
+     * @brief 次に送信するフレームの PTS を計算し、内部カウンターを更新する
+     *
+     * 最初のフレームの壁時計時刻を基点として実キャプチャ間隔を反映した PTS を
+     * 算出する（frame_count++ による固定間隔仮定では RTCP SR と VLC の
+     * タイムスタンプ整合性が崩れるため）。連続するフレームで PTS が同一または
+     * 逆転しないよう単調増加を保証する。CPU パス・GPU パス共通で使用する。
+     *
+     * @param meta フレームメタデータ
+     * @param fps  フレームレート
+     * @return 算出された PTS
+     */
+    int64_t compute_next_pts(const FrameMeta& meta, int fps) {
+        if (frame_count == 0) {
+            first_frame_time_us_ = meta.timestamp_us;
+        }
+        int64_t elapsed_us = meta.timestamp_us - first_frame_time_us_;
+        int64_t new_pts    = elapsed_us * static_cast<int64_t>(fps) / 1000000LL;
+        if (new_pts <= last_pts_) new_pts = last_pts_ + 1;
+        last_pts_ = new_pts;
+        frame_count++;
+        return new_pts;
+    }
 };
 
 EncoderController::EncoderController()
@@ -61,9 +96,187 @@ static AVPixelFormat pick_pix_fmt(const AVCodec* codec) {
     return fmts[0];
 }
 
+/**
+ * @brief GPU ゼロコピーパス (D3D11VA ハードウェアフレーム + NVENC) の確立を試みる
+ *
+ * shared_device 上に AVHWDeviceContext を構築し、BGRA テクスチャプールを持つ
+ * AVHWFramesContext を割り当てたうえで、AV_PIX_FMT_D3D11 入力の NVENC を開く。
+ * NVENC は D3D11 BGRA テクスチャを直接受け取り、内部 (GPU 上) で NV12 へ
+ * 変換してエンコードできるため、CPU 側での色空間変換が完全に不要になる。
+ *
+ * 失敗した場合は確保したリソースをすべて解放し false を返す。
+ * 呼び出し元は通常の CPU パス（sws_scale 経由）にフォールバックできる。
+ *
+ * @param codec          NVENC コーデック (h264_nvenc を想定)
+ * @param shared_device  キャプチャバックエンドと共有する ID3D11Device*
+ * @param config         エンコーダー設定
+ * @param width          フレーム幅 (px)
+ * @param height         フレーム高さ (px)
+ * @param[out] out_ctx          開いたコーデックコンテキスト
+ * @param[out] out_hw_device    AVHWDeviceContext への参照
+ * @param[out] out_hw_frames    AVHWFramesContext への参照 (BGRA テクスチャプール)
+ * @param[out] out_hw_frame     プールから取得した再利用可能なハードウェアフレーム
+ * @param[out] error            エラーメッセージ出力先
+ * @return 成功した場合 true
+ */
+static bool try_init_gpu_zero_copy(const AVCodec* codec, ID3D11Device* shared_device,
+                                   const EncoderConfig& config,
+                                   uint32_t width, uint32_t height,
+                                   AVCodecContext*& out_ctx,
+                                   AVBufferRef*& out_hw_device,
+                                   AVBufferRef*& out_hw_frames,
+                                   AVFrame*& out_hw_frame,
+                                   std::string& error) {
+    out_ctx = nullptr;
+    out_hw_device = nullptr;
+    out_hw_frames = nullptr;
+    out_hw_frame  = nullptr;
+
+    if (!shared_device) {
+        error = "shared D3D11 device is null";
+        return false;
+    }
+
+    // --- AVHWDeviceContext: キャプチャと同一の D3D11 デバイスをラップする ---
+    // デバイスは共有元 (DxgiCaptureBackend) が解放を管理しているため、
+    // FFmpeg 側のコンテキスト解放時に誤って Release されないよう AddRef する。
+    AVBufferRef* hw_device_ctx = av_hwdevice_ctx_alloc(AV_HWDEVICE_TYPE_D3D11VA);
+    if (!hw_device_ctx) {
+        error = "av_hwdevice_ctx_alloc(D3D11VA) failed";
+        return false;
+    }
+    auto* device_ctx = reinterpret_cast<AVHWDeviceContext*>(hw_device_ctx->data);
+    auto* d3d11_hwctx = static_cast<AVD3D11VADeviceContext*>(device_ctx->hwctx);
+    shared_device->AddRef();
+    d3d11_hwctx->device = shared_device;
+
+    // NVENC は D3D11 デバイスのマルチスレッド保護 (ID3D10Multithread) が
+    // 有効化されていることを要求する。FFmpeg が独自にデバイスを作成する場合
+    // (d3d11va_device_create) は SetMultithreadProtected(TRUE) を呼んでいるが、
+    // 既存デバイスを共有する本パスではその初期化が行われないため、ここで
+    // 明示的に有効化しておく。怠ると avcodec_send_frame が
+    // "Failed locking bitstream buffer: invalid device" で失敗する。
+    {
+        ID3D10Multithread* multithread = nullptr;
+        HRESULT mt_hr = shared_device->QueryInterface(__uuidof(ID3D10Multithread),
+                                                       reinterpret_cast<void**>(&multithread));
+        if (SUCCEEDED(mt_hr) && multithread) {
+            multithread->SetMultithreadProtected(TRUE);
+            multithread->Release();
+        }
+    }
+
+    int ret = av_hwdevice_ctx_init(hw_device_ctx);
+    if (ret < 0) {
+        char buf[256]; av_strerror(ret, buf, sizeof(buf));
+        error = "av_hwdevice_ctx_init failed: " + std::string(buf);
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+
+    // --- AVHWFramesContext: BGRA テクスチャプールを構築する ---
+    // sw_format=BGRA を指定することで、DXGI Desktop Duplication が出力する
+    // BGRA テクスチャをそのまま (色空間変換なしで) NVENC に渡せる。
+    AVBufferRef* hw_frames_ctx = av_hwframe_ctx_alloc(hw_device_ctx);
+    if (!hw_frames_ctx) {
+        error = "av_hwframe_ctx_alloc failed";
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+    auto* frames_ctx = reinterpret_cast<AVHWFramesContext*>(hw_frames_ctx->data);
+    frames_ctx->format            = AV_PIX_FMT_D3D11;
+    frames_ctx->sw_format         = AV_PIX_FMT_BGRA;
+    frames_ctx->width             = static_cast<int>(width);
+    frames_ctx->height            = static_cast<int>(height);
+    frames_ctx->initial_pool_size = 4;
+
+    auto* d3d11_frames = static_cast<AVD3D11VAFramesContext*>(frames_ctx->hwctx);
+    d3d11_frames->BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+
+    ret = av_hwframe_ctx_init(hw_frames_ctx);
+    if (ret < 0) {
+        char buf[256]; av_strerror(ret, buf, sizeof(buf));
+        error = "av_hwframe_ctx_init failed: " + std::string(buf);
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+
+    // --- コーデックコンテキストを D3D11 ハードウェアフレーム入力で開く ---
+    AVCodecContext* ctx = avcodec_alloc_context3(codec);
+    if (!ctx) {
+        error = "avcodec_alloc_context3 failed";
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+
+    ctx->codec_id      = codec->id;
+    ctx->bit_rate      = static_cast<int64_t>(config.bitrate_kbps) * 1000;
+    ctx->width         = static_cast<int>(width);
+    ctx->height        = static_cast<int>(height);
+    ctx->time_base     = {1, config.fps};
+    ctx->framerate     = {config.fps, 1};
+    ctx->gop_size      = config.gop_size;
+    ctx->max_b_frames  = config.max_b_frames;
+    ctx->pix_fmt       = AV_PIX_FMT_D3D11;
+    ctx->hw_frames_ctx = av_buffer_ref(hw_frames_ctx);
+    if (config.threads > 0) ctx->thread_count = config.threads;
+
+    AVDictionary* opts = nullptr;
+    if (!config.preset.empty())
+        av_dict_set(&opts, "preset", config.preset.c_str(), 0);
+    if (!config.tune.empty())
+        av_dict_set(&opts, "tune", config.tune.c_str(), 0);
+    // NVENC 低遅延設定 (CPU パスの h264_nvenc 設定と同一)
+    av_dict_set(&opts, "rc", "cbr", 0);
+    av_dict_set(&opts, "delay", "0", 0);
+
+    ret = avcodec_open2(ctx, codec, &opts);
+    av_dict_free(&opts);
+
+    if (ret < 0) {
+        char buf[256]; av_strerror(ret, buf, sizeof(buf));
+        error = "avcodec_open2 (GPU zero-copy) failed: " + std::string(buf);
+        avcodec_free_context(&ctx);
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+
+    // 再利用する AVFrame の入れ物を 1 つ確保しておく。
+    // 実際のバッファ参照は encode 毎に av_frame_unref() + av_hwframe_get_buffer()
+    // で取得し直す（プールからラウンドロビンで安全な書き込み先を得るため）。
+    AVFrame* hw_frame = av_frame_alloc();
+    if (!hw_frame) {
+        error = "av_frame_alloc (hw_frame) failed";
+        avcodec_free_context(&ctx);
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+    ret = av_hwframe_get_buffer(hw_frames_ctx, hw_frame, 0);
+    if (ret < 0) {
+        char buf[256]; av_strerror(ret, buf, sizeof(buf));
+        error = "av_hwframe_get_buffer failed: " + std::string(buf);
+        av_frame_free(&hw_frame);
+        avcodec_free_context(&ctx);
+        av_buffer_unref(&hw_frames_ctx);
+        av_buffer_unref(&hw_device_ctx);
+        return false;
+    }
+
+    out_ctx       = ctx;
+    out_hw_device = hw_device_ctx;
+    out_hw_frames = hw_frames_ctx;
+    out_hw_frame  = hw_frame;
+    return true;
+}
+
 bool EncoderController::init(const EncoderConfig& config,
                               uint32_t width, uint32_t height,
-                              std::string& error) {
+                              std::string& error,
+                              void* shared_d3d11_device) {
     reset();
     config_ = config;
     width_  = width;
@@ -77,6 +290,47 @@ bool EncoderController::init(const EncoderConfig& config,
     for (const auto& codec_name : codecs_to_try) {
         const AVCodec* codec = avcodec_find_encoder_by_name(codec_name.c_str());
         if (!codec) continue;
+
+        // NVENC かつ共有 D3D11 デバイスがある場合は、まず GPU ゼロコピーパスを試みる。
+        // 成功すれば CPU 側の色空間変換 (sws_scale) とテクスチャ読み戻し (Map/memcpy)
+        // を完全に回避できる。失敗した場合は通常の CPU パスにフォールバックする。
+        if (shared_d3d11_device && codec_name.find("nvenc") != std::string::npos) {
+            AVCodecContext* gpu_ctx       = nullptr;
+            AVBufferRef*    gpu_hw_device = nullptr;
+            AVBufferRef*    gpu_hw_frames = nullptr;
+            AVFrame*        gpu_hw_frame  = nullptr;
+            std::string     gpu_error;
+
+            if (try_init_gpu_zero_copy(codec, static_cast<ID3D11Device*>(shared_d3d11_device),
+                                       config, width, height,
+                                       gpu_ctx, gpu_hw_device, gpu_hw_frames, gpu_hw_frame,
+                                       gpu_error)) {
+                impl_->codec      = codec;
+                impl_->codec_ctx  = gpu_ctx;
+                impl_->codec_name = codec_name;
+                impl_->hw_device_ctx = gpu_hw_device;
+                impl_->hw_frames_ctx = gpu_hw_frames;
+                impl_->hw_frame      = gpu_hw_frame;
+                impl_->gpu_zero_copy_active = true;
+
+                impl_->pkt = av_packet_alloc();
+                if (!impl_->pkt) {
+                    error = "av_packet_alloc failed";
+                    reset();
+                    return false;
+                }
+
+                impl_->frame_count          = 0;
+                impl_->first_frame_time_us_ = 0;
+                impl_->last_pts_            = -1;
+                return true;
+            }
+
+            // GPU ゼロコピーパス確立失敗。ログ用にエラーを保持しつつ
+            // 通常の CPU パス (sws_scale 経由) で同じコーデック名を試す。
+            error = codec_name + ": GPU zero-copy init failed (" + gpu_error
+                    + "), falling back to CPU path";
+        }
 
         AVCodecContext* ctx = avcodec_alloc_context3(codec);
         if (!ctx) continue;
@@ -216,7 +470,27 @@ bool EncoderController::encode(const FrameBuffer& frame,
                                 const FrameMeta& meta,
                                 std::vector<EncodedPacket>& out_packets,
                                 bool content_changed) {
-    if (!impl_->codec_ctx || !impl_->sws_ctx || !impl_->yuv_frame) return false;
+    if (!impl_->codec_ctx) return false;
+
+    // --- GPU ゼロコピーパス ---
+    // frame に GPU テクスチャが設定されている場合、CPU 側の色空間変換を
+    // 介さずそのままハードウェアエンコーダーに渡す。
+    //
+    // 接続直後は、DxgiCaptureBackend がゼロコピーモードへ切り替わる直前に
+    // キャプチャされた CPU フレーム（gpu_texture を持たず BGRA データのみを
+    // 保持するもの）が freeze_buf として渡されてくることがある。
+    // DXGI Desktop Duplication は画面に変化が無い限り新規フレームを返さない
+    // ため、アイドル状態のモニターではこの過渡的な状態が数十秒以上続く
+    // ことがあり、単純にスキップするとその間ストリームへ何も送出されなくなる
+    // （IDR はおろか映像そのものが届かない）。
+    // そのため gpu_texture の有無に関わらず encode_gpu_zero_copy() に委譲し、
+    // CPU フレームの場合は内部で UpdateSubresource により直接アップロードする。
+    if (impl_->gpu_zero_copy_active) {
+        return encode_gpu_zero_copy(frame, meta, out_packets);
+    }
+
+    // --- CPU パス (sws_scale 経由) ---
+    if (!impl_->sws_ctx || !impl_->yuv_frame) return false;
 
     // ピクセル内容が変化している場合のみ BGRA → コーデックのピクセルフォーマット
     // 変換 (sws_scale) を行う。
@@ -240,21 +514,87 @@ bool EncoderController::encode(const FrameBuffer& frame,
                   impl_->yuv_frame->data, impl_->yuv_frame->linesize);
     }
 
-    // 最初のフレームの壁時計時刻を基点として PTS を計算する。
-    // frame_count++ による固定間隔仮定ではなく実キャプチャ間隔を反映させることで
-    // RTCP SR と VLC のタイムスタンプ整合性を保つ。
-    if (impl_->frame_count == 0) {
-        impl_->first_frame_time_us_ = meta.timestamp_us;
-    }
-    int64_t elapsed_us = meta.timestamp_us - impl_->first_frame_time_us_;
-    int64_t new_pts    = elapsed_us * static_cast<int64_t>(config_.fps) / 1000000LL;
-    // 連続するフレームで PTS が同一または逆転しないよう単調増加を保証する
-    if (new_pts <= impl_->last_pts_) new_pts = impl_->last_pts_ + 1;
-    impl_->yuv_frame->pts = new_pts;
-    impl_->last_pts_      = new_pts;
-    impl_->frame_count++;
+    impl_->yuv_frame->pts = impl_->compute_next_pts(meta, config_.fps);
 
     int ret = avcodec_send_frame(impl_->codec_ctx, impl_->yuv_frame);
+    if (ret < 0) return false;
+
+    return drain_encoder(impl_->codec_ctx, impl_->pkt, out_packets, config_.fps);
+}
+
+/**
+ * @brief GPU ゼロコピーパスでフレームをエンコードする
+ *
+ * 実装ノート:
+ * - frame.gpu_texture (DxgiCaptureBackend のテクスチャプール上の BGRA テクスチャ)
+ *   が設定されている通常ケースでは、ハードウェアフレームコンテキストの
+ *   プールテクスチャへ CopySubresourceRegion で GPU 内コピーする。これは
+ *   GPU メモリ帯域のみに依存する処理で、CPU は関与せずサブミリ秒で完了する
+ *   （sws_scale の 4K 約 12ms と比べて無視できるコスト）。
+ * - frame.gpu_texture が無く frame.data (CPU 側 BGRA データ) のみを持つ
+ *   過渡的なフレーム（接続直後、DxgiCaptureBackend がゼロコピーモードへ
+ *   切り替わる直前にキャプチャされたもの）の場合は UpdateSubresource で
+ *   直接アップロードする。DXGI Desktop Duplication は画面に変化が無い限り
+ *   新規フレームを返さないため、これを行わずスキップしてしまうと、
+ *   アイドル状態のモニターでは数十秒〜それ以上ストリームに何も
+ *   送出されない事態になる。
+ * - NVENC は送信したテクスチャ (D3D11 リソース) を非同期に処理するため、
+ *   単一の AVFrame を使い回してコピー先に書き込み続けると、エンコーダーが
+ *   まだ参照中のリソースを上書き登録することになり
+ *   "EncodePicture failed!: invalid param" で失敗する。
+ *   そのため毎フレーム impl_->hw_frame を unref したうえで
+ *   av_hwframe_get_buffer() でプールから新しい参照を取得し、
+ *   参照カウントに基づくラウンドロビンで安全な書き込み先を得る。
+ */
+bool EncoderController::encode_gpu_zero_copy(const FrameBuffer& frame,
+                                              const FrameMeta& meta,
+                                              std::vector<EncodedPacket>& out_packets) {
+    if (!impl_->hw_frames_ctx || !impl_->hw_frame) return false;
+
+    // プールから新しい参照を取得する（前のフレームの参照は解放され、
+    // エンコーダーが使用中であれば参照カウントにより保持され続ける）。
+    av_frame_unref(impl_->hw_frame);
+    int ret = av_hwframe_get_buffer(impl_->hw_frames_ctx, impl_->hw_frame, 0);
+    if (ret < 0) return false;
+
+    auto* frames_ctx  = reinterpret_cast<AVHWFramesContext*>(impl_->hw_frames_ctx->data);
+    auto* device_ctx  = reinterpret_cast<AVHWDeviceContext*>(frames_ctx->device_ref->data);
+    auto* d3d11_hwctx = static_cast<AVD3D11VADeviceContext*>(device_ctx->hwctx);
+
+    ID3D11Texture2D* dst_tex = reinterpret_cast<ID3D11Texture2D*>(impl_->hw_frame->data[0]);
+    UINT             dst_idx = static_cast<UINT>(reinterpret_cast<intptr_t>(impl_->hw_frame->data[1]));
+    if (!dst_tex) return false;
+
+    // lock/unlock は AVD3D11VADeviceContext が内部状態へのアクセスを
+    // 保護するために提供しているコールバックであり、推奨される作法に従う。
+    if (d3d11_hwctx->lock) d3d11_hwctx->lock(d3d11_hwctx->lock_ctx);
+    if (frame.gpu_texture) {
+        // 通常パス: GPU 内でのテクスチャ間コピー (CPU 同期を伴わない)
+        ID3D11Texture2D* src_tex = static_cast<ID3D11Texture2D*>(frame.gpu_texture.get());
+        d3d11_hwctx->device_context->CopySubresourceRegion(
+            dst_tex, dst_idx, 0, 0, 0, src_tex, 0, nullptr);
+    } else if (!frame.data.empty()) {
+        // 接続直後の過渡的な CPU フレーム（DxgiCaptureBackend がゼロコピー
+        // モードへ切り替わる直前にキャプチャしたもの）。
+        // DXGI Desktop Duplication は画面に変化が無い限り新規フレームを
+        // 返さないため、アイドル状態のモニターではこの状況が数十秒〜それ以上
+        // 継続することがある。その間ストリームへ一切何も送出されなくなる
+        // （IDR はおろか映像そのものが届かない）事態を避けるため、
+        // CPU 側で保持している直近の BGRA ピクセルデータを UpdateSubresource で
+        // 直接 GPU テクスチャへアップロードしてエンコードする
+        // （sw_format=BGRA のため sws_scale による色空間変換は不要）。
+        UINT row_pitch = static_cast<UINT>(frame.width) * 4;
+        d3d11_hwctx->device_context->UpdateSubresource(
+            dst_tex, dst_idx, nullptr, frame.data.data(), row_pitch, 0);
+    } else {
+        if (d3d11_hwctx->unlock) d3d11_hwctx->unlock(d3d11_hwctx->lock_ctx);
+        return false;
+    }
+    if (d3d11_hwctx->unlock) d3d11_hwctx->unlock(d3d11_hwctx->lock_ctx);
+
+    impl_->hw_frame->pts = impl_->compute_next_pts(meta, config_.fps);
+
+    ret = avcodec_send_frame(impl_->codec_ctx, impl_->hw_frame);
     if (ret < 0) return false;
 
     return drain_encoder(impl_->codec_ctx, impl_->pkt, out_packets, config_.fps);
@@ -271,12 +611,16 @@ void EncoderController::reset() {
     if (impl_->pkt)       { av_packet_free(&impl_->pkt); }
     if (impl_->yuv_frame) { av_frame_free(&impl_->yuv_frame); }
     if (impl_->sws_ctx)   { sws_freeContext(impl_->sws_ctx); impl_->sws_ctx = nullptr; }
+    if (impl_->hw_frame)      { av_frame_free(&impl_->hw_frame); }
+    if (impl_->hw_frames_ctx) { av_buffer_unref(&impl_->hw_frames_ctx); }
+    if (impl_->hw_device_ctx) { av_buffer_unref(&impl_->hw_device_ctx); }
     if (impl_->codec_ctx) { avcodec_free_context(&impl_->codec_ctx); }
     impl_->frame_count          = 0;
     impl_->first_frame_time_us_ = 0;
     impl_->last_pts_            = -1;
     impl_->codec                = nullptr;
     impl_->codec_name.clear();
+    impl_->gpu_zero_copy_active = false;
     width_  = 0;
     height_ = 0;
 }
@@ -295,6 +639,10 @@ int64_t EncoderController::first_frame_time_us() const {
 
 const std::string& EncoderController::selected_codec_name() const {
     return impl_->codec_name;
+}
+
+bool EncoderController::is_gpu_zero_copy_active() const {
+    return impl_->gpu_zero_copy_active;
 }
 
 EncoderController::CodecInfo EncoderController::get_codec_info() const {

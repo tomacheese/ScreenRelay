@@ -3,6 +3,7 @@
 #include <vector>
 #include <string>
 #include <algorithm>
+#include <memory>
 
 /**
  * @brief モニター単位のパイプラインステート
@@ -54,6 +55,21 @@ struct FrameBuffer {
     uint32_t width  = 0;         ///< 幅 (ピクセル)
     uint32_t height = 0;         ///< 高さ (ピクセル)
     PixelFormat format = PixelFormat::BGRA;  ///< ピクセルフォーマット
+
+    /**
+     * @brief GPU ゼロコピーパス用の D3D11 テクスチャハンドル (型消去)
+     *
+     * 実体は ID3D11Texture2D* への参照カウント付きハンドルであり、
+     * カスタムデリーターが Release() を呼び出す。共通ヘッダーを D3D11 に
+     * 依存させないため shared_ptr<void> で型消去している。
+     *
+     * 設定されている場合、キャプチャバックエンドは CPU 側の色空間変換・
+     * メモリコピー (Map/memcpy/sws_scale) を行わずに GPU テクスチャを
+     * そのまま引き渡しており、data は空のままでよい。エンコーダー側は
+     * このテクスチャを直接ハードウェアエンコーダーへ渡すゼロコピーパスを
+     * 使用できる。nullptr の場合は通常の CPU パス（data を使用）になる。
+     */
+    std::shared_ptr<void> gpu_texture;
 };
 
 /**

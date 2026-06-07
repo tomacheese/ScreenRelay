@@ -31,6 +31,20 @@ struct DxgiCaptureBackend::Impl {
     int     physical_width  = 0;   ///< 物理解像度の幅
     int     physical_height = 0;   ///< 物理解像度の高さ
     uint64_t frame_seq      = 0;   ///< フレームシーケンス番号
+
+    /**
+     * @brief GPU ゼロコピーパス用テクスチャプール
+     *
+     * AcquireNextFrame で取得したテクスチャは ReleaseFrame() 後に無効になるため、
+     * CPU を介さず GPU 上でこのプール内のテクスチャへ CopyResource する。
+     * リングバッファ方式で使い回すことで、フリーズフレームキャッシュや
+     * フレームキューに残った古い参照の内容が新しいキャプチャで上書きされる
+     * ことを防ぐ（D3D11 イミディエイトコンテキストはコマンドの発行順序を
+     * 保証するため、サブリソースの読み取り後書き込みの整合性は保たれる）。
+     */
+    static constexpr int kZeroCopyPoolSize = 6;
+    ID3D11Texture2D* zero_copy_pool[kZeroCopyPoolSize] = {};  ///< プール本体
+    int  zero_copy_pool_idx = 0;                              ///< 次に使用するプールインデックス
 };
 
 // ---------------------------------------------------------------------------
@@ -68,6 +82,10 @@ bool DxgiCaptureBackend::init(HMONITOR monitor, int logical_width, int logical_h
     logical_height_ = logical_height;
 
     if (!find_and_init(monitor)) {
+        // 部分初期化された COM リソース（デバイス・デスクトップ複製・
+        // ステージングテクスチャ・ゼロコピープール等）を確実に解放する。
+        // find_and_init() 内でアダプター・ファクトリーは解放済み。
+        release();
         return false;
     }
 
@@ -146,6 +164,33 @@ std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
         }
         impl_->duplication->ReleaseFrame();
         return std::nullopt;
+    }
+
+    // GPU ゼロコピーモード: CPU を介さず GPU 上でテクスチャプールへコピーし、
+    // 参照をそのまま FrameBuffer に格納して返す。Map/memcpy/sws_scale を行わない。
+    if (zero_copy_mode_.load()) {
+        ID3D11Texture2D* dst = impl_->zero_copy_pool[impl_->zero_copy_pool_idx];
+        impl_->zero_copy_pool_idx = (impl_->zero_copy_pool_idx + 1) % Impl::kZeroCopyPoolSize;
+
+        // GPU 内でのテクスチャ間コピー (CPU 同期を伴わない)
+        impl_->context->CopyResource(dst, tex);
+        tex->Release();
+        tex = nullptr;
+        impl_->duplication->ReleaseFrame();
+
+        // 参照カウントを増やしてラップする。デリーターが Release() を呼び出すことで
+        // テクスチャはプールに留まり続け、FrameBuffer 側は単に参照を保持するのみとなる。
+        dst->AddRef();
+        std::shared_ptr<void> handle(dst, [](void* p) {
+            static_cast<ID3D11Texture2D*>(p)->Release();
+        });
+
+        FrameBuffer fb;
+        fb.width       = static_cast<uint32_t>(impl_->physical_width);
+        fb.height      = static_cast<uint32_t>(impl_->physical_height);
+        fb.format      = PixelFormat::BGRA;
+        fb.gpu_texture = std::move(handle);
+        return fb;
     }
 
     // ステージングテクスチャへコピーする
@@ -284,6 +329,16 @@ void DxgiCaptureBackend::release() {
         impl_->staging_tex = nullptr;
     }
 
+    // GPU ゼロコピーパス用テクスチャプールを解放する
+    for (int i = 0; i < Impl::kZeroCopyPoolSize; ++i) {
+        if (impl_->zero_copy_pool[i]) {
+            impl_->zero_copy_pool[i]->Release();
+            impl_->zero_copy_pool[i] = nullptr;
+        }
+    }
+    impl_->zero_copy_pool_idx = 0;
+    zero_copy_mode_.store(false);
+
     // デスクトップ複製インターフェースを解放する
     if (impl_->duplication) {
         impl_->duplication->Release();
@@ -301,6 +356,34 @@ void DxgiCaptureBackend::release() {
         impl_->device->Release();
         impl_->device = nullptr;
     }
+}
+
+/**
+ * @brief キャプチャに使用している D3D11 デバイスを返す
+ * @return ID3D11Device* (型消去)。未初期化の場合は nullptr
+ */
+void* DxgiCaptureBackend::gpu_device() const {
+    return impl_->device;
+}
+
+/**
+ * @brief GPU ゼロコピーパスが利用可能かどうかを返す
+ *
+ * sws_ctx が構築されている（物理解像度と論理解像度が異なる）場合は
+ * GPU 側でスケーリングを行う実装を持たないため false を返す。
+ *
+ * @return ゼロコピーパスが利用可能なら true
+ */
+bool DxgiCaptureBackend::supports_zero_copy() const {
+    return impl_->device != nullptr && impl_->sws_ctx == nullptr;
+}
+
+/**
+ * @brief ゼロコピーモードの有効・無効を切り替える
+ * @param enabled true で有効化、false で無効化
+ */
+void DxgiCaptureBackend::set_zero_copy_mode(bool enabled) {
+    zero_copy_mode_.store(enabled);
 }
 
 // ---------------------------------------------------------------------------
@@ -424,6 +507,27 @@ bool DxgiCaptureBackend::find_and_init(HMONITOR hmonitor) {
                     factory->Release();
                     return false;
                 }
+
+                // GPU ゼロコピーパス用テクスチャプールを作成する
+                // (D3D11_USAGE_DEFAULT・GPU 内のみで完結し CPU からはアクセスしない。
+                //  BindFlags はエンコーダー側のハードウェアフレームコンテキストへの
+                //  コピー元として利用できるよう SHADER_RESOURCE を指定する)
+                D3D11_TEXTURE2D_DESC zc_desc = tex_desc;
+                zc_desc.Usage          = D3D11_USAGE_DEFAULT;
+                zc_desc.BindFlags      = D3D11_BIND_SHADER_RESOURCE;
+                zc_desc.CPUAccessFlags = 0;
+
+                for (int i = 0; i < Impl::kZeroCopyPoolSize; ++i) {
+                    hr = impl_->device->CreateTexture2D(&zc_desc, nullptr, &impl_->zero_copy_pool[i]);
+                    if (FAILED(hr) || !impl_->zero_copy_pool[i]) {
+                        last_error_ = "CreateTexture2D (zero-copy pool) failed: HRESULT=" +
+                                      std::to_string(static_cast<long>(hr));
+                        adapter->Release();
+                        factory->Release();
+                        return false;
+                    }
+                }
+                impl_->zero_copy_pool_idx = 0;
 
                 found = true;
                 adapter->Release();

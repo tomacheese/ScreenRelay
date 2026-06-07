@@ -149,12 +149,20 @@ bool ScreenPipeline::do_connect() {
     }
 
     // エンコーダーを初期化する
+    // GPU ゼロコピーパスを有効化できるか試すため、キャプチャバックエンドが
+    // 物理解像度=論理解像度（スケーリング不要）の場合に限り D3D11 デバイスを共有する
+    void* shared_d3d11_device = nullptr;
+    if (capture_backend_->supports_zero_copy()) {
+        shared_d3d11_device = capture_backend_->gpu_device();
+    }
+
     encoder_ = std::make_unique<EncoderController>();
     std::string enc_err;
     if (!encoder_->init(config_.encoder,
                         static_cast<uint32_t>(current_width_),
                         static_cast<uint32_t>(current_height_),
-                        enc_err)) {
+                        enc_err,
+                        shared_d3d11_device)) {
         log_->log_error("ENCODER_INIT_FAILED", enc_err);
         encoder_.reset();
         if (!state_machine_.transition_to(PipelineState::FATAL)) {
@@ -163,6 +171,14 @@ bool ScreenPipeline::do_connect() {
         }
         return false;
     }
+
+    // エンコーダーが GPU ゼロコピーパスを確立できた場合のみキャプチャ側を
+    // ゼロコピーモードに切り替える（CPU 側の色空間変換・読み戻しを完全に省略する）
+    const bool gpu_zero_copy = encoder_->is_gpu_zero_copy_active();
+    capture_backend_->set_zero_copy_mode(gpu_zero_copy);
+    log_->log_event(spdlog::level::info, "gpu_zero_copy_mode",
+                    {{"monitor", std::to_string(monitor_info_.number)},
+                     {"active", gpu_zero_copy ? "true" : "false"}});
 
     const std::string& actual_codec = encoder_->selected_codec_name();
     log_->log_encoder_initialized(monitor_info_.number,

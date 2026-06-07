@@ -27,14 +27,34 @@ public:
      * config.codec を優先コーデックとして試し、失敗した場合は
      * config.fallback_codecs の順でフォールバックを試みる。
      *
-     * @param config   エンコーダー設定
-     * @param width    フレーム幅 (px)
-     * @param height   フレーム高さ (px)
-     * @param error    エラーメッセージ出力先
+     * shared_d3d11_device が指定され、かつ優先コーデックが NVENC である場合、
+     * まず GPU ゼロコピーパス（D3D11VA ハードウェアフレームコンテキスト経由で
+     * BGRA テクスチャを直接 NVENC に渡す方式）の確立を試みる。これにより
+     * CPU 側での色空間変換 (sws_scale) とテクスチャ読み戻し (Map/memcpy) を
+     * 完全に回避できる。失敗した場合は通常の CPU パスにフォールバックする。
+     *
+     * @param config              エンコーダー設定
+     * @param width               フレーム幅 (px)
+     * @param height              フレーム高さ (px)
+     * @param error               エラーメッセージ出力先
+     * @param shared_d3d11_device GPU ゼロコピーパスで共有する ID3D11Device* (型消去)。
+     *                            nullptr の場合は CPU パスのみを使用する
      * @return 成功した場合 true
      */
     bool init(const EncoderConfig& config, uint32_t width, uint32_t height,
-              std::string& error);
+              std::string& error, void* shared_d3d11_device = nullptr);
+
+    /**
+     * @brief GPU ゼロコピーパスが有効かどうかを返す
+     *
+     * init() が GPU ハードウェアフレームコンテキスト経由での
+     * エンコーダー初期化に成功した場合に true を返す。
+     * true の場合、encode() に渡す FrameBuffer に gpu_texture が
+     * 設定されていれば、CPU 変換を介さないゼロコピーパスが使用される。
+     *
+     * @return GPU ゼロコピーパスが有効なら true
+     */
+    bool is_gpu_zero_copy_active() const;
 
     /**
      * @brief BGRA フレームをエンコードする
@@ -49,6 +69,19 @@ public:
      *                        静止画面のフリーズフレーム再送時に
      *                        CPU 負荷（色空間変換コスト）を大幅に削減できる。
      *                        省略した場合は true 扱い（常に変換する）。
+     *                        GPU ゼロコピーパス使用時は GPU 側コピーが
+     *                        十分に高速なため、このフラグに関わらず
+     *                        毎フレームコピーを実行する。
+     *
+     * is_gpu_zero_copy_active() が true の場合は、frame.gpu_texture の有無に
+     * 関わらず常に GPU ゼロコピーパスを使用する。
+     * - frame.gpu_texture が設定されている場合: GPU 内コピー (CopySubresourceRegion)
+     * - frame.gpu_texture が未設定で frame.data がある場合: CPU→GPU アップロード
+     *   (UpdateSubresource)。接続直後のゼロコピーモード切り替え前に取得した
+     *   過渡的な CPU フレームに対応し、アイドルモニターでの映像断を防ぐ。
+     * is_gpu_zero_copy_active() が false の場合は frame.data を BGRA バッファと
+     * して扱い、sws_scale で変換してからエンコードする（CPU パス）。
+     *
      * @return 成功した場合 true
      */
     bool encode(const FrameBuffer& frame, const FrameMeta& meta,
@@ -138,6 +171,22 @@ public:
     int64_t first_frame_time_us() const;
 
 private:
+    /**
+     * @brief GPU ゼロコピーパスでフレームをエンコードする
+     *
+     * frame.gpu_texture が参照する D3D11 テクスチャを、ハードウェアフレーム
+     * コンテキストのプールテクスチャへ GPU 内コピー (CopySubresourceRegion) し、
+     * そのまま avcodec_send_frame に渡す。CPU 側の色空間変換・メモリコピーは
+     * 一切発生しない。
+     *
+     * @param frame       GPU テクスチャを保持する FrameBuffer
+     * @param meta        フレームメタデータ
+     * @param out_packets エンコード済みパケット出力先
+     * @return 成功した場合 true
+     */
+    bool encode_gpu_zero_copy(const FrameBuffer& frame, const FrameMeta& meta,
+                              std::vector<EncodedPacket>& out_packets);
+
     /** Pimpl による実装詳細の隠蔽 */
     struct Impl;
     std::unique_ptr<Impl> impl_;

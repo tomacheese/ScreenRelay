@@ -86,6 +86,36 @@ public:
      */
     bool has_hard_error() const override { return hard_error_.load(); }
 
+    /**
+     * @brief キャプチャに使用している D3D11 デバイスを返す
+     *
+     * EncoderController が GPU ゼロコピーパス用のハードウェアフレーム
+     * コンテキストを同一デバイス上に構築するために使用する。
+     *
+     * @return ID3D11Device* (型消去)。未初期化の場合は nullptr
+     */
+    void* gpu_device() const override;
+
+    /**
+     * @brief GPU ゼロコピーパスが利用可能かどうかを返す
+     *
+     * 物理解像度と論理解像度が一致し、sws_ctx によるスケーリングが
+     * 不要な場合のみ true を返す。
+     *
+     * @return ゼロコピーパスが利用可能なら true
+     */
+    bool supports_zero_copy() const override;
+
+    /**
+     * @brief ゼロコピーモードの有効・無効を切り替える
+     *
+     * 有効化すると acquire_frame() は CPU 側のメモリコピーを行わず、
+     * GPU テクスチャ参照のみを返す。
+     *
+     * @param enabled true で有効化、false で無効化
+     */
+    void set_zero_copy_mode(bool enabled) override;
+
 private:
     /**
      * @brief HMONITOR に対応する DXGI アダプターとアウトプットを検索して初期化する
@@ -104,4 +134,5 @@ private:
     mutable std::mutex last_error_mutex_;           ///< last_error_ 保護用ミューテックス
     std::string        last_error_;                 ///< 最後のエラーメッセージ (last_error_mutex_ 保護下)
     std::atomic<bool>  hard_error_{false};          ///< ACCESS_LOST 等の再初期化が必要なエラーフラグ
+    std::atomic<bool>  zero_copy_mode_{false};      ///< GPU ゼロコピーモード有効フラグ
 };

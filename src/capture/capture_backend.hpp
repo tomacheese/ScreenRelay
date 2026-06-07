@@ -67,4 +67,40 @@ public:
      * @return ハードエラーが発生していれば true
      */
     virtual bool has_hard_error() const { return false; }
+
+    /**
+     * @brief GPU ゼロコピーパスで共有する D3D11 デバイスを返す
+     *
+     * EncoderController が同一デバイス上にハードウェアフレームコンテキストを
+     * 構築できるようにするために使用する。同一デバイスを共有することで、
+     * キャプチャしたテクスチャをエンコーダーに渡す際のコピーが GPU 内で完結し、
+     * CPU を介したデータ転送（Map/memcpy/sws_scale）を回避できる。
+     *
+     * @return ID3D11Device* (型消去)。GPU ゼロコピーをサポートしない
+     *         バックエンドや未初期化の場合は nullptr
+     */
+    virtual void* gpu_device() const { return nullptr; }
+
+    /**
+     * @brief GPU ゼロコピーパスが利用可能かどうかを返す
+     *
+     * 物理解像度と論理解像度が一致しスケーリングが不要な場合のみ true を返す。
+     * スケーリングが必要な場合は GPU 側での変換実装が必要になるため、
+     * 現状では CPU パス（sws_scale）にフォールバックする。
+     *
+     * @return ゼロコピーパスが利用可能なら true
+     */
+    virtual bool supports_zero_copy() const { return false; }
+
+    /**
+     * @brief ゼロコピーモードの有効・無効を切り替える
+     *
+     * 有効化すると、acquire_frame() は CPU 側のメモリコピー・色空間変換を
+     * 行わず、GPU テクスチャ参照のみを FrameBuffer::gpu_texture に設定する。
+     * EncoderController が GPU ゼロコピーパスを確立できた場合にのみ
+     * 呼び出し元（ScreenPipeline）が有効化する。
+     *
+     * @param enabled true で有効化、false で無効化（CPU パスへ復帰）
+     */
+    virtual void set_zero_copy_mode(bool enabled) { (void)enabled; }
 };

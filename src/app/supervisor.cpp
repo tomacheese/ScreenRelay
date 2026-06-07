@@ -155,7 +155,7 @@ bool ScreenPipeline::do_init_and_capture() {
     // このフレームは GPU ゼロコピーモード切り替え前（CPU パス）で取得されるため
     // gpu_texture は null だが、encode_gpu_zero_copy() が UpdateSubresource で
     // 対応するため問題ない。
-    initial_frame_buf_  = buf;
+    initial_frame_buf_  = std::move(buf);   // buf は以降不要のため move して不要なコピーを避ける
     initial_frame_meta_ = meta;
 
     return true;

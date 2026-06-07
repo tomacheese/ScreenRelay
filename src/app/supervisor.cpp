@@ -133,6 +133,16 @@ bool ScreenPipeline::do_init_and_capture() {
     current_height_ = static_cast<int>(buf.height);
     metrics_->set_resolution(monitor_info_.number, current_width_, current_height_);
 
+    // 初期フリーズフレームとして保存する。
+    // DXGI Desktop Duplication は画面に変化がない限り次のフレームを返さないため、
+    // do_streaming_loop() の freeze_buf がアイドルモニターで長時間空のままになる
+    // （結果としてストリームが真っ暗になる）問題を防ぐ。
+    // このフレームは GPU ゼロコピーモード切り替え前（CPU パス）で取得されるため
+    // gpu_texture は null だが、encode_gpu_zero_copy() が UpdateSubresource で
+    // 対応するため問題ない。
+    initial_frame_buf_  = buf;
+    initial_frame_meta_ = meta;
+
     return true;
 }
 
@@ -243,10 +253,15 @@ void ScreenPipeline::do_streaming_loop() {
     uint64_t bytes_since_last  = 0;
     uint64_t frames_since_last = 0;
 
-    // 静止画面でのフリーズフレーム繰り返し用キャッシュ
-    FrameBuffer freeze_buf;
-    FrameMeta   freeze_meta{};
-    bool        has_freeze = false;
+    // 静止画面でのフリーズフレーム繰り返し用キャッシュ。
+    // do_init_and_capture() が保存した初期フレームを起点とすることで、
+    // DXGI が次のフレームを返すまでの間（アイドルモニターでは 24 秒以上）
+    // ストリームが真っ暗になる問題を防ぐ。
+    FrameBuffer freeze_buf  = std::move(initial_frame_buf_);
+    FrameMeta   freeze_meta = initial_frame_meta_;
+    bool        has_freeze  = (!freeze_buf.data.empty() || freeze_buf.gpu_texture != nullptr);
+    // 使用したら解放してメモリを節約する（高解像度フレームは数十 MB になる）
+    initial_frame_meta_ = {};
 
     // 直前に encode() したフレームからピクセル内容が変化しているか。
     // DXGI Desktop Duplication は画面に変化があった場合のみ新規フレームを

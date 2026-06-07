@@ -38,13 +38,22 @@ public:
 
     /**
      * @brief BGRA フレームをエンコードする
-     * @param frame       BGRA フレームバッファ
-     * @param meta        フレームメタデータ
-     * @param out_packets エンコード済みパケットの出力先
+     *
+     * @param frame           BGRA フレームバッファ
+     * @param meta            フレームメタデータ
+     * @param out_packets     エンコード済みパケットの出力先
+     * @param content_changed 直前に encode() したフレームからピクセル内容が
+     *                        変化している場合は true。false を渡すと
+     *                        sws_scale による BGRA→YUV 変換を省略し、
+     *                        直前の変換結果（YUV フレーム）を再利用する。
+     *                        静止画面のフリーズフレーム再送時に
+     *                        CPU 負荷（色空間変換コスト）を大幅に削減できる。
+     *                        省略した場合は true 扱い（常に変換する）。
      * @return 成功した場合 true
      */
     bool encode(const FrameBuffer& frame, const FrameMeta& meta,
-                std::vector<EncodedPacket>& out_packets);
+                std::vector<EncodedPacket>& out_packets,
+                bool content_changed = true);
 
     /**
      * @brief エンコーダーをフラッシュする

@@ -82,6 +82,10 @@ bool DxgiCaptureBackend::init(HMONITOR monitor, int logical_width, int logical_h
     logical_height_ = logical_height;
 
     if (!find_and_init(monitor)) {
+        // 部分初期化された COM リソース（デバイス・デスクトップ複製・
+        // ステージングテクスチャ・ゼロコピープール等）を確実に解放する。
+        // find_and_init() 内でアダプター・ファクトリーは解放済み。
+        release();
         return false;
     }
 

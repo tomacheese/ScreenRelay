@@ -73,11 +73,14 @@ public:
      *                        十分に高速なため、このフラグに関わらず
      *                        毎フレームコピーを実行する。
      *
-     * frame.gpu_texture が設定されており、かつ is_gpu_zero_copy_active() が
-     * true の場合は GPU ゼロコピーパスを使用する（CPU 側の色空間変換を行わず、
-     * GPU 上でテクスチャをハードウェアエンコーダーに直接渡す）。
-     * それ以外の場合は frame.data を BGRA バッファとして扱い、
-     * sws_scale で変換してからエンコードする（CPU パス）。
+     * is_gpu_zero_copy_active() が true の場合は、frame.gpu_texture の有無に
+     * 関わらず常に GPU ゼロコピーパスを使用する。
+     * - frame.gpu_texture が設定されている場合: GPU 内コピー (CopySubresourceRegion)
+     * - frame.gpu_texture が未設定で frame.data がある場合: CPU→GPU アップロード
+     *   (UpdateSubresource)。接続直後のゼロコピーモード切り替え前に取得した
+     *   過渡的な CPU フレームに対応し、アイドルモニターでの映像断を防ぐ。
+     * is_gpu_zero_copy_active() が false の場合は frame.data を BGRA バッファと
+     * して扱い、sws_scale で変換してからエンコードする（CPU パス）。
      *
      * @return 成功した場合 true
      */

@@ -133,6 +133,23 @@ private:
      */
     std::vector<std::string> make_rtsp_urls() const;
 
+    /**
+     * @brief DXGI キャプチャバックエンドをリトライ付きで初期化する
+     *
+     * 解像度変更直後や GPU を共有する別モニターの RECONFIGURING と競合した場合、
+     * DuplicateOutput が E_ACCESSDENIED を返すことがある。200ms 間隔で最大 15 回
+     * リトライし、stop_requested_ が立てば途中で打ち切る。
+     *
+     * do_init_and_capture() と do_reconfigure() で重複していた
+     * リトライループをここに集約する。
+     *
+     * @param backend 初期化対象のバックエンド (null 不可)
+     * @param width   論理幅 (px)
+     * @param height  論理高さ (px)
+     * @return 初期化に成功した場合 true
+     */
+    bool init_capture_with_retry(ICaptureBackend* backend, int width, int height);
+
     MonitorInfo   monitor_info_;                ///< 対象モニター情報
     AppConfig     config_;                      ///< アプリケーション設定
     std::shared_ptr<LogSink>      log_;         ///< ログシンク

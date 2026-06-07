@@ -2,6 +2,7 @@
 #define NOMINMAX
 #include <windows.h>
 #include <d3d11.h>
+#include <d3d10.h>   // ID3D10Multithread (D3D11 イミディエイトコンテキストの排他制御に使用)
 #include <dxgi1_2.h>
 
 extern "C" {
@@ -45,6 +46,17 @@ struct DxgiCaptureBackend::Impl {
     static constexpr int kZeroCopyPoolSize = 6;
     ID3D11Texture2D* zero_copy_pool[kZeroCopyPoolSize] = {};  ///< プール本体
     int  zero_copy_pool_idx = 0;                              ///< 次に使用するプールインデックス
+
+    /**
+     * @brief D3D11 イミディエイトコンテキストのマルチスレッド保護インターフェース
+     *
+     * FFmpeg の d3d11_hwctx->lock/unlock は av_hwdevice_ctx_init 内で
+     * ID3D10Multithread::Enter/Leave にバインドされる。FramePump スレッドから
+     * CopyResource を呼ぶ際にも同一ロックを取得することで、エンコーダースレッドの
+     * CopySubresourceRegion との排他を保証する（D3D11 イミディエイトコンテキストは
+     * スレッドセーフでないため、明示的な相互排除が必要）。
+     */
+    ID3D10Multithread* multithread = nullptr;
 };
 
 // ---------------------------------------------------------------------------
@@ -172,8 +184,13 @@ std::optional<FrameBuffer> DxgiCaptureBackend::acquire_frame(int timeout_ms) {
         ID3D11Texture2D* dst = impl_->zero_copy_pool[impl_->zero_copy_pool_idx];
         impl_->zero_copy_pool_idx = (impl_->zero_copy_pool_idx + 1) % Impl::kZeroCopyPoolSize;
 
-        // GPU 内でのテクスチャ間コピー (CPU 同期を伴わない)
+        // GPU 内でのテクスチャ間コピー。
+        // エンコーダースレッドが FFmpeg の d3d11_hwctx->lock (= ID3D10Multithread::Enter) で
+        // 保護している CopySubresourceRegion と排他するため、同一ロックを取得する。
+        // これにより D3D11 イミディエイトコンテキストへの並行アクセスによる UB を防ぐ。
+        if (impl_->multithread) impl_->multithread->Enter();
         impl_->context->CopyResource(dst, tex);
+        if (impl_->multithread) impl_->multithread->Leave();
         tex->Release();
         tex = nullptr;
         impl_->duplication->ReleaseFrame();
@@ -339,6 +356,12 @@ void DxgiCaptureBackend::release() {
     impl_->zero_copy_pool_idx = 0;
     zero_copy_mode_.store(false);
 
+    // ID3D10Multithread インターフェースを解放する（デバイスコンテキスト/デバイスより先）
+    if (impl_->multithread) {
+        impl_->multithread->Release();
+        impl_->multithread = nullptr;
+    }
+
     // デスクトップ複製インターフェースを解放する
     if (impl_->duplication) {
         impl_->duplication->Release();
@@ -451,6 +474,23 @@ bool DxgiCaptureBackend::find_and_init(HMONITOR hmonitor) {
                     adapter->Release();
                     factory->Release();
                     return false;
+                }
+
+                // D3D11 イミディエイトコンテキストのマルチスレッド保護を有効化し、
+                // インターフェースをキャッシュする。
+                // FramePump スレッドの CopyResource とエンコーダースレッドの
+                // CopySubresourceRegion が同一コンテキストに並行アクセスするため、
+                // FFmpeg が d3d11_hwctx->lock として使う ID3D10Multithread::Enter/Leave
+                // と同一ロックを取得することで排他を保証する。
+                {
+                    ID3D10Multithread* mt = nullptr;
+                    HRESULT mt_hr = impl_->device->QueryInterface(
+                        __uuidof(ID3D10Multithread), reinterpret_cast<void**>(&mt));
+                    if (SUCCEEDED(mt_hr) && mt) {
+                        mt->SetMultithreadProtected(TRUE);
+                        impl_->multithread = mt;
+                        // Release は release() で行うため、ここでは解放しない
+                    }
                 }
 
                 // IDXGIOutput から IDXGIOutput1 を取得する

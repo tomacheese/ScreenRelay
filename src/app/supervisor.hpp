@@ -159,6 +159,14 @@ private:
     BackoffState  rtsp_backoff_;               ///< RTSP 再接続バックオフ状態
     int           current_width_  = 0;         ///< 現在のフレーム幅
     int           current_height_ = 0;         ///< 現在のフレーム高さ
+
+    /// @brief do_init_and_capture() で取得した最初のフレーム。
+    ///        do_streaming_loop() の初期フリーズフレームとして使用し、
+    ///        DXGI が次のフレームを返すまでの間（アイドルモニターでは
+    ///        24 秒以上かかることがある）もストリームに映像が届くようにする。
+    ///        使用後は解放してメモリを節約する。
+    FrameBuffer initial_frame_buf_;
+    FrameMeta   initial_frame_meta_{};
 };
 
 // ─── MonitorSupervisor ─────────────────────────────────────

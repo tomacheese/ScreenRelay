@@ -16,9 +16,10 @@
 | エンコード | ビットレート | デフォルト 4000 kbps (設定可変) |
 | エンコード | GOP / B フレーム | GOP = FPS 値、B フレーム = 0 (低遅延固定) |
 | モニター | 最大台数 | 4 台 |
-| モニター | 番号体系 | Windows 設定アプリのディスプレイ番号 (\\.\DISPLAYn の n) |
-| モニター | プライマリ特例 | screen0 を追加エイリアスとして発行 → プライマリは 2 ストリーム配信 |
+| モニター | 番号体系 | Windows 設定アプリのディスプレイ番号 (\\.\DISPLAYn の n)。毎ポーリング再計算し Windows が再パックすれば 1 ポーリング以内に追従 |
+| モニター | プライマリ特例 | screen0 を追加エイリアスとして発行 → 常に現在のプライマリを指す、切替時に 1 ポーリング以内追従 |
 | モニター | 変更検知 | ポーリング (デフォルト 1 秒)、接続時に再開・切断時に停止 |
+| モニター | パイプライン管理 | CCD API (monitorDevicePath) による物理モニター安定 ID をキーとして管理 |
 | モニター | ミラー表示 | ソース画面のみ配信 |
 | 配信 | プロトコル | RTSP (ANNOUNCE/RECORD) |
 | 配信 | パスパターン | `/live/screen{n}` (設定可変) |
@@ -75,17 +76,25 @@ main()
 
 - `EnumDisplayMonitors()` を `monitor_check_interval_ms` ごとにポーリング
 - 各 HMONITOR に対して `GetMonitorInfo()` → `MONITORINFOEX.szDevice` から番号抽出
-  - `\\.\DISPLAY2` → monitor_number = 2
-- `MONITORINFOF_PRIMARY` フラグでプライマリ判定
+  - `\\.\DISPLAY2` → monitor_number = 2（Windows 設定ディスプレイ番号、毎ポーリング再計算）
+- `MONITORINFOF_PRIMARY` フラグでプライマリ判定（毎ポーリング再評価）
 - ミラー表示の除外: `EnumDisplayDevices()` で `DISPLAY_DEVICE_MIRRORING_DRIVER` フラグをチェック
-- 変化検知 (追加 / 削除 / 解像度変更) を `MonitorSupervisor` にコールバック通知
+- CCD API (`QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` + `DisplayConfigGetDeviceInfo`) で物理モニター安定 ID (`monitorDevicePath`) を取得し `MonitorInfo::stable_id` に格納する
+  - CCD 失敗時は `device_name` をフォールバックとして使用する
 
 ```
 モニター状態変化の種別:
-  ADDED     → ScreenPipeline 生成・起動
-  REMOVED   → ScreenPipeline 停止・破棄
-  RESIZED   → ScreenPipeline へ RECONFIGURING イベント送信
+  ADDED          → ScreenPipeline 生成・起動
+  REMOVED        → ScreenPipeline 停止・破棄
+  RESIZED        → ScreenPipeline へ RECONFIGURING イベント送信
+  RETARGETED     → number/primary/handle 変化 → ScreenPipeline 停止・再生成
+                   (/screen0 プライマリ追従・screenN Settings 番号追従を保証)
 ```
+
+#### パイプライン管理キー
+
+`MonitorSupervisor::pipelines_` のキーは `stable_id`（物理モニター単位で安定な ID）。
+これにより Windows がモニター番号を再パックしても、物理モニターとパイプラインの対応が崩れない。
 
 #### プライマリモニターの RTSP パス生成
 
@@ -96,6 +105,10 @@ primary monitor (\\.\DISPLAY2, Windows 番号 = 2)
 non-primary monitor (\\.\DISPLAY1, Windows 番号 = 1)
   → paths: ["/live/screen1"]
 ```
+
+プライマリが別のモニターに移った場合（例: モニター電源断）、`apply_monitor_changes()` が
+number/is_primary/handle の変化を検知してパイプラインを再生成するため、`/screen0` は
+1 ポーリング以内に新プライマリの映像へ追従する。
 
 ### 3.2 CaptureBackend インターフェース
 
@@ -311,10 +324,11 @@ FFmpeg は LGPL 動的リンクにより、アプリ本体を MIT ライセン�
 - **内容**: ノート PC 等の iGPU + dGPU 環境で、各モニターが異なるアダプターに接続される場合がある
 - **対策**: `EnumDisplayDevices` でモニターのアダプター名を特定し、対応する `IDXGIAdapter` を使って `DuplicateOutput` を呼出す
 
-### R3: Windows ディスプレイ番号の信頼性 (低リスク)
+### R3: Windows ディスプレイ番号の信頼性 (対応済み・低リスク)
 
-- **内容**: `\\.\DISPLAYn` の n が常に Windows 設定と一致するかは構成依存
-- **対策**: 起動時に検出したマッピングをログに出力し、ユーザーが確認できるようにする。将来的に設定ファイルで手動マッピングを上書きできる拡張ポイントを設ける
+- **内容**: `\\.\DISPLAYn` の n がモニター電源断・切断・再起動で変化する場合がある（Windows が番号を再パックする）
+- **対応**: パイプラインのキーを CCD API の `monitorDevicePath`（物理モニター単位で安定な ID）に変更した。番号は毎ポーリング再計算して Windows 設定に追従する。プライマリ変化も毎ポーリングで検知して再ターゲットする
+- **残存リスク**: CCD API が失敗した環境では `device_name` をフォールバックとして使用するため、デバイス名の再パックが発生する構成では稀に番号ずれが生じる可能性がある（同 API 失敗はレガシー GPU や特殊なドライバー環境に限られる）
 
 ### R4: NVENC セッション上限 (既知・設計済み)
 

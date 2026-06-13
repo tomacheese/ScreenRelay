@@ -152,15 +152,19 @@ avcodec_find_encoder("h264_nvenc")
 
 ## プライマリモニターの二重配信
 
-プライマリモニター（デバイス名 `\\.\DISPLAY1` 等の最初のモニター）は 2 本の `RtspPublisherClient` を持ちます。
+プライマリモニター（`MONITORINFOF_PRIMARY` フラグが立つモニター）は 2 本の `RtspPublisherClient` を持ちます。
 
 ```text
 ScreenPipeline (primary=true)
-├── RtspPublisherClient → rtsp://host:8554/screen1
-└── RtspPublisherClient → rtsp://host:8554/screen0  (エイリアス)
+├── RtspPublisherClient → rtsp://host:8554/screen2   (例: \\.\DISPLAY2 がプライマリの場合)
+└── RtspPublisherClient → rtsp://host:8554/screen0   (プライマリエイリアス)
 ```
 
 これにより `/screen0` でプライマリモニターの映像を常に受信できます。モニター番号を意識せずにプライマリ映像を参照したいクライアントはこの URL を使用してください。
+
+**プライマリ切替時の追従**: モニター電源断・切断などでプライマリが別モニターへ移った場合、
+`MonitorSupervisor::apply_monitor_changes()` が `is_primary` の変化を検知して影響するパイプラインを
+再生成します。`monitor_check_interval_ms`（デフォルト 1 秒）以内に `/screen0` が新プライマリへ追従します。
 
 ---
 
@@ -180,5 +184,5 @@ ScreenPipeline (primary=true)
 - **RTSP トランスポート**: 現状 TCP のみ（UDP 非対応）
 - **ピクセルフォーマット**: DXGI は BGRA で出力する（RGBA ではない）。swscale で YUV に変換する際は `AV_PIX_FMT_BGRA` を指定すること
 - **キャプチャバックエンド**: 現在 DXGI のみ実装（WGC は未実装）。`ICaptureBackend` インターフェースを実装することで追加バックエンドを組み込み可能
-- **モニター番号**: デバイス名 `\\.\DISPLAYn` の `n` を使用。OS によって番号が変わる場合がある
+- **モニター番号**: デバイス名 `\\.\DISPLAYn` の `n` を使用。毎ポーリングで Windows 設定に追従する。パイプライン管理は CCD API (`monitorDevicePath`) による安定 ID でキーイングするため、番号変化（OS 再パック・プライマリ切替）でもパイプラインと物理モニターの対応が崩れない
 - **DRM コンテンツ**: Protected content（DRM）が有効な映像の含まれる画面は DXGI Desktop Duplication が失敗する場合がある

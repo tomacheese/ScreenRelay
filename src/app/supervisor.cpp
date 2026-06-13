@@ -732,21 +732,33 @@ void MonitorSupervisor::request_stop() {
 
 /**
  * @brief 現在のモニター一覧と前回の一覧を比較して差分を適用する
+ *
+ * パイプライン管理には物理モニター単位で安定な `stable_id` をキーとして使用する。
+ * これにより、Windows がモニター番号を再パックしてもパイプラインと物理モニターの
+ * 対応が崩れない。
+ *
+ * 以下の 4 ケースを処理する:
+ * - **削除**: stable_id が現行に無ければパイプラインを停止・破棄する。
+ * - **追加**: 現行の stable_id がマップに無ければ新規パイプラインを生成・起動する。
+ * - **FATAL 再起動**: 既存パイプラインが FATAL ならば停止・再生成する。
+ * - **再ターゲット**: number / is_primary / handle が変化した場合（プライマリ昇格や
+ *   番号再割り当てなど）、パイプラインを stop → 再生成することで /screen0 の
+ *   プライマリ追従と screenN の Settings 番号追従を保証する。
+ * - **解像度のみ変化**: 上記と独立に notify_resized() で軽量対処する。
  */
 void MonitorSupervisor::apply_monitor_changes(
         const std::vector<MonitorInfo>& current) {
     std::lock_guard<std::mutex> lk(pipelines_mutex_);
 
-    // モニター番号のセットを構築する
-    std::set<int> current_nums, last_nums;
-    for (const auto& m : current)       current_nums.insert(m.number);
-    for (const auto& m : last_monitors_) last_nums.insert(m.number);
+    // stable_id のセットを構築する
+    std::set<std::string> current_ids;
+    for (const auto& m : current) current_ids.insert(m.stable_id);
 
     // 削除されたモニターのパイプラインを停止する
     for (const auto& mi : last_monitors_) {
-        if (current_nums.find(mi.number) == current_nums.end()) {
+        if (current_ids.find(mi.stable_id) == current_ids.end()) {
             log_->log_monitor_removed(mi.number);
-            auto it = pipelines_.find(mi.number);
+            auto it = pipelines_.find(mi.stable_id);
             if (it != pipelines_.end()) {
                 it->second->stop();
                 pipelines_.erase(it);
@@ -754,21 +766,39 @@ void MonitorSupervisor::apply_monitor_changes(
         }
     }
 
-    // 追加されたモニター、または FATAL 状態になったパイプラインを(再)起動する
+    // 追加・FATAL・再ターゲットのパイプラインを処理する
     for (const auto& mi : current) {
-        auto it = pipelines_.find(mi.number);
+        auto it          = pipelines_.find(mi.stable_id);
         const bool is_new   = (it == pipelines_.end());
         const bool is_fatal = (!is_new && it->second->is_fatal());
 
-        if (is_new || is_fatal) {
+        // 再ターゲット判定: 同一物理モニターで number / is_primary / handle が変化した場合
+        // → /screen0 のプライマリ追従・screenN の Settings 番号追従のためにパイプラインを再生成する
+        bool needs_retarget = false;
+        if (!is_new && !is_fatal) {
+            const auto& p = it->second;
+            needs_retarget = (p->number()     != mi.number     ||
+                              p->is_primary() != mi.is_primary ||
+                              p->handle()     != mi.handle);
+        }
+
+        if (is_new || is_fatal || needs_retarget) {
             if (is_fatal) {
-                // FATAL パイプラインを停止して削除し、再生成する
                 it->second->stop();
                 pipelines_.erase(it);
                 log_->log_event(spdlog::level::warn,
                                 "pipeline_restart",
-                                {{"monitor", std::to_string(mi.number)},
-                                 {"reason",  "FATAL pipeline restarting"}});
+                                {{"monitor",   std::to_string(mi.number)},
+                                 {"stable_id", mi.stable_id},
+                                 {"reason",    "FATAL pipeline restarting"}});
+            } else if (needs_retarget) {
+                it->second->stop();
+                pipelines_.erase(it);
+                log_->log_event(spdlog::level::info,
+                                "pipeline_retarget",
+                                {{"monitor",   std::to_string(mi.number)},
+                                 {"stable_id", mi.stable_id},
+                                 {"reason",    "number/primary/handle changed — retargeting pipeline"}});
             } else {
                 log_->log_monitor_added(mi.number, mi.device_name,
                                         mi.logical_width, mi.logical_height,
@@ -777,17 +807,20 @@ void MonitorSupervisor::apply_monitor_changes(
             auto pipeline = std::make_unique<ScreenPipeline>(
                 mi, config_, log_, metrics_);
             pipeline->start();
-            pipelines_[mi.number] = std::move(pipeline);
+            pipelines_[mi.stable_id] = std::move(pipeline);
         }
     }
 
-    // 解像度が変更されたモニターに通知する
+    // 解像度が変更されたモニターに通知する（再ターゲット不要なもののみ）
     for (const auto& mi : current) {
         for (const auto& lm : last_monitors_) {
-            if (mi.number == lm.number &&
+            if (mi.stable_id == lm.stable_id          &&
+                mi.number     == lm.number             &&
+                mi.is_primary == lm.is_primary         &&
+                mi.handle     == lm.handle             &&
                 (mi.logical_width  != lm.logical_width ||
                  mi.logical_height != lm.logical_height)) {
-                auto it = pipelines_.find(mi.number);
+                auto it = pipelines_.find(mi.stable_id);
                 if (it != pipelines_.end()) {
                     it->second->notify_resized(mi.logical_width, mi.logical_height);
                 }
@@ -856,7 +889,7 @@ void MonitorSupervisor::run() {
     // グレースフルシャットダウン: 全パイプラインを停止する
     {
         std::lock_guard<std::mutex> lk(pipelines_mutex_);
-        for (auto& [num, pipeline] : pipelines_) {
+        for (auto& [sid, pipeline] : pipelines_) {
             pipeline->stop();
         }
         pipelines_.clear();

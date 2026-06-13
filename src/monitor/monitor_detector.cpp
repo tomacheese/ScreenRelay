@@ -3,6 +3,7 @@
 #include <windows.h>
 #include "monitor/monitor_detector.hpp"
 #include <cctype>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -76,16 +77,130 @@ static BOOL CALLBACK monitor_enum_callback(HMONITOR hmon, HDC /*hdc*/, LPRECT /*
 }
 
 // ---------------------------------------------------------------------------
+// CCD ヘルパー
+// ---------------------------------------------------------------------------
+
+/**
+ * @brief CCD API を使用して GDI デバイス名 → 物理モニター安定 ID のマップを構築する
+ *
+ * `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` でアクティブなディスプレイパスを列挙し、
+ * 各パスのソース名（= `\\.\DISPLAYn`）とターゲット名（物理モニターの `monitorDevicePath`）を
+ * 対応付けたマップを返す。
+ *
+ * `monitorDevicePath` はモニターの EDID/デバイスインスタンス ID を含み、
+ * 電源断・切断・再起動を経ても同じ物理パネルに対して変化しない安定 ID として機能する。
+ *
+ * 失敗（API 非対応環境・エラー）時は空のマップを返す。呼び出し元が device_name を
+ * フォールバックとして使用することで堅牢性を保つ。
+ *
+ * @return デバイス名（"\\.\DISPLAYn"）→ monitorDevicePath のマップ
+ */
+static std::map<std::string, std::string> build_ccd_table() {
+    std::map<std::string, std::string> table;
+
+    // アクティブパス数とモード数を取得する
+    UINT32 num_paths = 0, num_modes = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &num_paths, &num_modes)
+            != ERROR_SUCCESS) {
+        return table;
+    }
+
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(num_paths);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(num_modes);
+
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS,
+                            &num_paths, paths.data(),
+                            &num_modes, modes.data(),
+                            nullptr) != ERROR_SUCCESS) {
+        return table;
+    }
+
+    for (UINT32 i = 0; i < num_paths; ++i) {
+        // ソース側: GDI デバイス名（"\\.\DISPLAYn"）を取得する
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME src_name{};
+        src_name.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        src_name.header.size      = sizeof(src_name);
+        src_name.header.adapterId = paths[i].sourceInfo.adapterId;
+        src_name.header.id        = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&src_name.header) != ERROR_SUCCESS) continue;
+
+        // ターゲット側: 物理モニターのデバイスパスを取得する
+        DISPLAYCONFIG_TARGET_DEVICE_NAME tgt_name{};
+        tgt_name.header.type      = DISPLAYCONFIG_DEVICE_INFO_GET_TARGET_NAME;
+        tgt_name.header.size      = sizeof(tgt_name);
+        tgt_name.header.adapterId = paths[i].targetInfo.adapterId;
+        tgt_name.header.id        = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&tgt_name.header) != ERROR_SUCCESS) continue;
+
+        // WCHAR → UTF-8 変換: ソース GDI 名
+        std::string gdi_name;
+        {
+            int len = WideCharToMultiByte(
+                CP_UTF8, 0,
+                src_name.viewGdiDeviceName, -1,
+                nullptr, 0, nullptr, nullptr);
+            if (len > 0) {
+                gdi_name.resize(static_cast<size_t>(len - 1));
+                WideCharToMultiByte(
+                    CP_UTF8, 0,
+                    src_name.viewGdiDeviceName, -1,
+                    gdi_name.data(), len - 1, nullptr, nullptr);
+            }
+        }
+
+        // WCHAR → UTF-8 変換: ターゲット monitorDevicePath
+        std::string monitor_path;
+        {
+            int len = WideCharToMultiByte(
+                CP_UTF8, 0,
+                tgt_name.monitorDevicePath, -1,
+                nullptr, 0, nullptr, nullptr);
+            if (len > 0) {
+                monitor_path.resize(static_cast<size_t>(len - 1));
+                WideCharToMultiByte(
+                    CP_UTF8, 0,
+                    tgt_name.monitorDevicePath, -1,
+                    monitor_path.data(), len - 1, nullptr, nullptr);
+            }
+        }
+
+        if (!gdi_name.empty() && !monitor_path.empty()) {
+            table[gdi_name] = monitor_path;
+        }
+    }
+
+    return table;
+}
+
+// ---------------------------------------------------------------------------
 // MonitorDetector の実装
 // ---------------------------------------------------------------------------
 
 /**
  * @brief 現在接続されている (ミラーを除く) モニターを列挙する
+ *
+ * EnumDisplayMonitors でモニターを列挙した後、CCD API（QueryDisplayConfig）で
+ * 取得した物理モニター安定 ID（monitorDevicePath）を各 MonitorInfo の
+ * stable_id フィールドに格納する。CCD 取得失敗時は device_name をフォールバックとして使用する。
+ *
  * @return 検出されたモニターの一覧
  */
 std::vector<MonitorInfo> MonitorDetector::enumerate() {
     std::vector<MonitorInfo> result;
     EnumDisplayMonitors(nullptr, nullptr, monitor_enum_callback, reinterpret_cast<LPARAM>(&result));
+
+    // CCD テーブルを構築して stable_id を補完する
+    auto ccd_table = build_ccd_table();
+    for (auto& mi : result) {
+        auto it = ccd_table.find(mi.device_name);
+        if (it != ccd_table.end() && !it->second.empty()) {
+            mi.stable_id = it->second;
+        } else {
+            // CCD 取得失敗時は device_name をフォールバックとして使用する
+            mi.stable_id = mi.device_name;
+        }
+    }
+
     return result;
 }
 

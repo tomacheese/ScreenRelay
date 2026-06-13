@@ -78,6 +78,7 @@ target_compile_definitions(screen_relay_lib PUBLIC
     _UNICODE
     WIN32_LEAN_AND_MEAN
     NOMINMAX
+    _WIN32_WINNT=0x0A00
 )
 
 target_link_libraries(screen_relay_lib PUBLIC
@@ -88,6 +89,7 @@ target_link_libraries(screen_relay_lib PUBLIC
     dxgi
     d3dcompiler
     ws2_32
+    user32
 )
 
 if(FFMPEG_LIBRARY_DIRS)

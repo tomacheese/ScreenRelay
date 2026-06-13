@@ -61,20 +61,12 @@ struct EncoderController::Impl {
         int64_t elapsed_us = meta.timestamp_us - first_frame_time_us_;
         int64_t new_pts    = elapsed_us * static_cast<int64_t>(fps) / 1000000LL;
 
-        // RTP タイムスタンプ 32-bit オーバーフロー防止。
-        // RTP_ts = PTS * 90000 / fps であり、PTS が 0xFFFFFFFF * fps / 90000 に
-        // 達すると RTP タイムスタンプが uint32_t をオーバーフローする
-        // (60fps では約 13.3 時間)。オーバーフロー直前でリセットし、
-        // 接続中クライアントへの影響を最小化する（RTP 仕様上、タイムスタンプの
-        // ラップアラウンドは許容されており RFC 3550 準拠クライアントは処理できる）。
-        constexpr int64_t kRtpClock  = 90000LL;
-        const     int64_t kPtsWrapAt = static_cast<int64_t>(0xFFFFFFFFLL) * fps / kRtpClock;
-        if (new_pts >= kPtsWrapAt) {
-            first_frame_time_us_ = meta.timestamp_us;
-            last_pts_            = -1;
-            new_pts              = 0;
-        }
-
+        // PTS は単調増加を維持する。RTP タイムスタンプの 32-bit ラップアラウンドは
+        // FFmpeg RTP マルチプレクサが uint32_t への切り捨てで透過的に処理するため、
+        // PTS 側でリセットする必要はない。仮にリセットすると AVPacket の PTS/DTS が
+        // 巻き戻り av_interleaved_write_frame の non-monotonic timestamp エラーを
+        // 引き起こす（RFC 3550 のラップアラウンドは RTP ヘッダ層の仕様であり、
+        // FFmpeg の AVPacket タイムスタンプは int64_t で単調増加が前提）。
         if (new_pts <= last_pts_) new_pts = last_pts_ + 1;
         last_pts_ = new_pts;
         frame_count++;

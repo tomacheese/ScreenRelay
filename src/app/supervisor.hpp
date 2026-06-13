@@ -72,9 +72,33 @@ public:
 
     /**
      * @brief モニター番号を返す
-     * @return モニター番号
+     * @return モニター番号（Windows 設定ディスプレイ番号）
      */
     int monitor_number() const { return monitor_info_.number; }
+
+    /**
+     * @brief モニター番号を返す
+     * @return モニター番号（Windows 設定ディスプレイ番号）
+     */
+    int number() const { return monitor_info_.number; }
+
+    /**
+     * @brief プライマリモニターかどうかを返す
+     * @return プライマリモニターなら true
+     */
+    bool is_primary() const { return monitor_info_.is_primary; }
+
+    /**
+     * @brief 物理モニターの安定 ID を返す
+     * @return stable_id（CCD monitorDevicePath、失敗時は device_name）
+     */
+    const std::string& stable_id() const { return monitor_info_.stable_id; }
+
+    /**
+     * @brief モニターハンドルを返す
+     * @return HMONITOR
+     */
+    HMONITOR handle() const { return monitor_info_.handle; }
 
     /**
      * @brief FATAL ステートかどうかを返す
@@ -253,8 +277,8 @@ private:
     std::shared_ptr<LogSink>      log_;         ///< ログシンク
     std::shared_ptr<MetricsStore> metrics_;     ///< メトリクスストア
 
-    std::map<int, std::unique_ptr<ScreenPipeline>> pipelines_;  ///< モニター番号→パイプラインのマップ
-    std::mutex pipelines_mutex_;                                  ///< パイプラインマップ保護用 mutex
+    std::map<std::string, std::unique_ptr<ScreenPipeline>> pipelines_;  ///< stable_id→パイプラインのマップ
+    std::mutex pipelines_mutex_;                                         ///< パイプラインマップ保護用 mutex
 
     std::vector<MonitorInfo> last_monitors_;    ///< 前回のモニター一覧
 

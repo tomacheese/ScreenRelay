@@ -12,11 +12,16 @@
  */
 struct MonitorInfo {
     HMONITOR handle         = nullptr;
-    int      number         = 0;          ///< \\.\DISPLAYn の n
+    int      number         = 0;          ///< \\.\DISPLAYn の n（Windows 設定ディスプレイ番号）
     int      logical_width  = 0;          ///< 論理解像度の幅 (DPI スケーリング後)
     int      logical_height = 0;          ///< 論理解像度の高さ (DPI スケーリング後)
     bool     is_primary     = false;      ///< プライマリモニターなら true
     std::string device_name;              ///< デバイス名 (例: "\\.\DISPLAY2")
+    std::string stable_id;               ///< 物理モニター単位で安定な ID
+                                          ///<   CCD API の monitorDevicePath（例:
+                                          ///<   "\\\\?\\DISPLAY#DELA0BC#...#{...}"）。
+                                          ///<   CCD 取得失敗時は device_name にフォールバック。
+                                          ///<   パイプライン管理のキーとして使用する。
 };
 
 /**

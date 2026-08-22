@@ -139,6 +139,22 @@ RTSP 配信が開始されたときに記録されます。
 {"ts":"2026-04-30T19:21:02.000Z","event":"publish_started","fps":"60","height":"1080","monitor":"1","url":"rtsp://192.168.0.100:8554/screen1","width":"1920"}
 ```
 
+### audio_pipeline_started
+
+共有音声パイプラインの起動に成功したときに記録されます。
+
+```json
+{"ts":"2026-04-30T19:20:59.000Z","event":"audio_pipeline_started"}
+```
+
+### audio_encode_recovered
+
+音声エンコードが失敗状態から復帰したときに記録されます（連続失敗中は最初の 1 回のみ `AUDIO_ENCODE_FAILED` エラーが記録され、復帰時にこのイベントが 1 回だけ記録されます）。
+
+```json
+{"ts":"2026-04-30T19:31:00.000Z","event":"audio_encode_recovered"}
+```
+
 ### error
 
 エラーが発生したときに記録されます。
@@ -160,6 +176,8 @@ RTSP 配信が開始されたときに記録されます。
 | `RTSP_SEND_FAILED` | RTP パケット送信エラー |
 | `RTSP_TIMEOUT` | RTSP 送信タイムアウト |
 | `FATAL_ERROR` | 回復不能なエラー |
+| `AUDIO_INIT_FAILED` | 音声パイプライン初期化失敗（映像配信は継続） |
+| `AUDIO_ENCODE_FAILED` | 音声エンコード失敗（バッファを破棄して継続） |
 
 ---
 

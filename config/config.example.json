@@ -29,6 +29,14 @@
     "reconnect_max_delay_ms": 30000,
     "reconnect_backoff_multiplier": 2.0
   },
+  "audio": {
+    "enabled": false,
+    "source": "loopback",
+    "device_id": "",
+    "bitrate_kbps": 128,
+    "sample_rate": 48000,
+    "channels": 2
+  },
   "runtime": {
     "monitor_check_interval_ms": 1000,
     "shutdown_grace_ms": 3000,

@@ -5,6 +5,7 @@
 #include <string>
 #include <atomic>
 #include "app/supervisor.hpp"
+#include "audio/audio_capture.hpp"
 #include "config/config_loader.hpp"
 
 /** @brief グローバル停止フラグ。コンソールハンドラーから設定される */
@@ -51,8 +52,21 @@ int main(int argc, char* argv[]) {
         std::string arg = argv[i];
         if ((arg == "--config" || arg == "-c") && i + 1 < argc) {
             config_path = argv[++i];
+        } else if (arg == "--list-audio-devices") {
+            std::string enum_error;
+            auto devices = WasapiAudioCapture::enumerate_devices(enum_error);
+            if (!enum_error.empty()) {
+                std::cerr << "[ERROR] " << enum_error << "\n";
+                return 1;
+            }
+            for (const auto& d : devices) {
+                std::cout << (d.is_render ? "[loopback] " : "[capture]  ")
+                          << d.id << "  " << d.name << "\n";
+            }
+            return 0;
         } else if (arg == "--help" || arg == "-h") {
-            std::cerr << "Usage: " << argv[0] << " [--config <path>]\n";
+            std::cerr << "Usage: " << argv[0]
+                      << " [--config <path>] [--list-audio-devices]\n";
             return 0;
         }
     }

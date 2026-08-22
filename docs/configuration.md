@@ -45,6 +45,14 @@ screen-relay.exe --config path/to/config.json
     "reconnect_max_delay_ms": 30000,
     "reconnect_backoff_multiplier": 2.0
   },
+  "audio": {
+    "enabled": false,
+    "source": "loopback",
+    "device_id": "",
+    "bitrate_kbps": 128,
+    "sample_rate": 48000,
+    "channels": 2
+  },
   "runtime": {
     "monitor_check_interval_ms": 1000,
     "shutdown_grace_ms": 3000,
@@ -183,6 +191,42 @@ delay(n) = min(reconnect_delay_ms × reconnect_backoff_multiplier^n, reconnect_m
 - `reconnect_delay_ms` は 1 以上でなければなりません
 - `reconnect_max_delay_ms` は `reconnect_delay_ms` 以上でなければなりません
 - `reconnect_backoff_multiplier` は 1.0 以上でなければなりません
+
+---
+
+## `audio` セクション
+
+音声配信の設定です。有効にすると、WASAPI で取得した音声を AAC でエンコードし、**全モニターの RTSP ストリーム**（`/screen1`, `/screen2`, ... `/screen0`）に同一の音声として配信します。
+
+| フィールド | 型 | デフォルト | 説明 |
+|---|---|---|---|
+| `enabled` | bool | `false` | 音声配信を有効にするか |
+| `source` | string | `"loopback"` | 音声取得元。`"loopback"`（システム再生音）または `"capture"`（マイク等の録音デバイス） |
+| `device_id` | string | `""` | WASAPI エンドポイント ID。空の場合は既定デバイスを使用する。デバイス一覧は `--list-audio-devices` で確認できる |
+| `bitrate_kbps` | integer | `128` | AAC エンコードビットレート（kbps） |
+| `sample_rate` | integer | `48000` | エンコード後のサンプルレート（Hz） |
+| `channels` | integer | `2` | エンコード後のチャンネル数（`1`=モノラル、`2`=ステレオ） |
+
+### 対象デバイスの選び方
+
+利用可能な音声デバイス（ループバック用のレンダリングデバイス、および録音デバイス）を確認するには次のコマンドを実行します。
+
+```bash
+screen-relay.exe --list-audio-devices
+```
+
+出力された `id` を `device_id` に設定してください。`device_id` を空にした場合は、`source` に応じた既定デバイス（既定の再生デバイス、または既定の録音デバイス）が使用されます。
+
+### 音声の初期化に失敗した場合
+
+音声パイプラインの初期化（デバイスの取得や AAC エンコーダーの初期化）に失敗しても、映像配信には影響しません。エラーはログに記録され、音声なしで起動を継続します。
+
+### バリデーション（`enabled: true` の場合のみ）
+
+- `source` は `"loopback"` または `"capture"` でなければなりません
+- `bitrate_kbps` は 1 以上でなければなりません
+- `sample_rate` は 1 以上でなければなりません
+- `channels` は `1` または `2` でなければなりません
 
 ---
 

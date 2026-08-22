@@ -16,21 +16,33 @@
 
 ScreenPipeline::ScreenPipeline(const MonitorInfo& info, const AppConfig& config,
                                 std::shared_ptr<LogSink> log,
-                                std::shared_ptr<MetricsStore> metrics)
+                                std::shared_ptr<MetricsStore> metrics,
+                                std::shared_ptr<AudioPipeline> audio_pipeline)
     : monitor_info_(info)
     , config_(config)
     , log_(std::move(log))
-    , metrics_(std::move(metrics)) {
+    , metrics_(std::move(metrics))
+    , audio_pipeline_(std::move(audio_pipeline)) {
     // ステート遷移コールバックを登録する
     state_machine_.on_transition([this](PipelineState from, PipelineState to) {
         log_->log_state_changed(monitor_info_.number,
                                 state_name(from), state_name(to));
         metrics_->set_state(monitor_info_.number, state_name(to));
     });
+
+    // 音声配信が有効な場合、共有音声パイプラインを購読する。
+    // 全モニターの RTSP ストリームに同一の音声を配信するため、
+    // パイプラインの生存期間を通じて購読を維持する。
+    if (audio_pipeline_) {
+        audio_queue_ = audio_pipeline_->subscribe();
+    }
 }
 
 ScreenPipeline::~ScreenPipeline() {
     stop();
+    if (audio_pipeline_ && audio_queue_) {
+        audio_pipeline_->unsubscribe(audio_queue_);
+    }
 }
 
 void ScreenPipeline::start() {
@@ -222,13 +234,31 @@ bool ScreenPipeline::do_connect() {
 
     // RTSP クライアントを接続する
     auto codec_info = encoder_->get_codec_info();
+    // RTCP SR の NTP 基点を明示的に現在時刻へ固定する。
+    // RtspPublisherClient::connect() は stream_start_us が 0 の場合 av_gettime() に
+    // フォールバックするが、音声 pts の再計算にも同じ基準を使う必要があるため、
+    // ここで確定させて共有する。
+    const int64_t connect_wallclock_us = time_utils::system_now_us();
+    codec_info.stream_start_us = connect_wallclock_us;
     auto urls = make_rtsp_urls();
     rtsp_clients_.clear();
+
+    // 共有音声パイプラインが稼働中であれば、そのコーデック情報を全 RTSP
+    // ストリームに付与する。音声 pts の再計算は connect_wallclock_us
+    // （RTCP SR の NTP 基点）を基準にすることで映像との同期を保つ。
+    bool has_audio = (audio_pipeline_ && audio_pipeline_->is_running());
+    AudioCodecInfo audio_info;
+    if (has_audio) {
+        audio_info = audio_pipeline_->get_codec_info();
+        audio_stream_start_us_ = connect_wallclock_us;
+        last_audio_pts_        = -1;
+    }
 
     for (const auto& url : urls) {
         auto client = std::make_unique<RtspPublisherClient>();
         std::string rtsp_err;
-        if (!client->connect(url, config_.rtsp, codec_info, rtsp_err)) {
+        if (!client->connect(url, config_.rtsp, codec_info, rtsp_err,
+                             has_audio ? &audio_info : nullptr)) {
             log_->log_error("RTSP_CONNECT_FAILED", rtsp_err,
                             {{"url", url},
                              {"monitor", std::to_string(monitor_info_.number)}});
@@ -311,6 +341,36 @@ void ScreenPipeline::do_streaming_loop() {
                                 "Cannot transition to RECONFIGURING from STREAMING");
             }
             return;
+        }
+
+        // 音声パケットを送信する。音声はキャプチャ間隔が映像と異なるため
+        // 毎ループ先に排出するが、1 回のループで排出するパケット数には上限を
+        // 設ける。av_interleaved_write_frame は同期的なネットワーク呼び出しの
+        // ため、無制限に排出すると滞留時に映像フレームの送信間隔を乱してしまう。
+        if (audio_queue_) {
+            EncodedPacket apkt;
+            constexpr int kMaxAudioPacketsPerLoop = 16;
+            for (int i = 0; i < kMaxAudioPacketsPerLoop && audio_queue_->try_pop(apkt); ++i) {
+                // capture_timestamp_us（絶対キャプチャ時刻）を、この RTSP 接続の
+                // NTP 基点 (audio_stream_start_us_) からの相対サンプル数に変換する。
+                int64_t rel_us = apkt.capture_timestamp_us - audio_stream_start_us_;
+                if (rel_us < 0) rel_us = 0;
+                int64_t pts = (rel_us * apkt.time_base_den) / 1000000LL;
+                if (pts <= last_audio_pts_) pts = last_audio_pts_ + 1;
+                last_audio_pts_ = pts;
+                apkt.pts = pts;
+                apkt.dts = pts;
+
+                for (auto& client : rtsp_clients_) {
+                    if (client->has_audio_stream()) {
+                        if (!client->send_audio_packet(apkt)) {
+                            log_->log_error("RTSP_SEND_FAILED",
+                                            "Audio packet send failed for monitor "
+                                            + std::to_string(monitor_info_.number));
+                        }
+                    }
+                }
+            }
         }
 
         // 次のフレーム送信時刻までの残り待機時間を計算する
@@ -467,13 +527,23 @@ void ScreenPipeline::do_reconnect() {
         // これにより接続時の av_gettime() ではなく実際のストリーム開始時刻が使われ、
         // VLC が受信するパケットのタイムスタンプが現在時刻より大幅にずれるのを防ぐ。
         codec_info.stream_start_us = encoder_->first_frame_time_us();
+
+        bool has_audio = (audio_pipeline_ && audio_pipeline_->is_running());
+        AudioCodecInfo audio_info;
+        if (has_audio) {
+            audio_info = audio_pipeline_->get_codec_info();
+            audio_stream_start_us_ = codec_info.stream_start_us;
+            last_audio_pts_        = -1;
+        }
+
         bool all_ok = true;
         std::vector<std::unique_ptr<RtspPublisherClient>> new_clients;
 
         for (const auto& url : urls) {
             auto client = std::make_unique<RtspPublisherClient>();
             std::string err;
-            if (!client->connect(url, config_.rtsp, codec_info, err)) {
+            if (!client->connect(url, config_.rtsp, codec_info, err,
+                                 has_audio ? &audio_info : nullptr)) {
                 log_->log_error("RTSP_RECONNECT_FAILED", err,
                                 {{"url", url},
                                  {"monitor", std::to_string(monitor_info_.number)}});
@@ -723,6 +793,21 @@ bool MonitorSupervisor::init(const AppConfig& config, std::string& error) {
 
     metrics_ = std::make_shared<MetricsStore>();
 
+    // 音声配信が有効な場合は共有音声パイプラインを起動する。
+    // 初期化に失敗しても音声なしで映像配信は継続できるよう、エラーはログのみに留める。
+    if (config_.audio.enabled) {
+        auto audio_pipeline = std::make_shared<AudioPipeline>();
+        std::string audio_err;
+        if (audio_pipeline->start(config_.audio, audio_err, log_)) {
+            audio_pipeline_ = std::move(audio_pipeline);
+            log_->log_event(spdlog::level::info, "audio_pipeline_started", {});
+        } else {
+            log_->log_error("AUDIO_INIT_FAILED",
+                            "Audio pipeline failed to start, continuing without audio: "
+                            + audio_err);
+        }
+    }
+
     return true;
 }
 
@@ -805,7 +890,7 @@ void MonitorSupervisor::apply_monitor_changes(
                                         mi.is_primary);
             }
             auto pipeline = std::make_unique<ScreenPipeline>(
-                mi, config_, log_, metrics_);
+                mi, config_, log_, metrics_, audio_pipeline_);
             pipeline->start();
             pipelines_[mi.stable_id] = std::move(pipeline);
         }
@@ -893,6 +978,11 @@ void MonitorSupervisor::run() {
             pipeline->stop();
         }
         pipelines_.clear();
+    }
+
+    // 全パイプラインが購読解除された後に音声パイプラインを停止する
+    if (audio_pipeline_) {
+        audio_pipeline_->stop();
     }
 
     if (monitor_thread_.joinable()) monitor_thread_.join();

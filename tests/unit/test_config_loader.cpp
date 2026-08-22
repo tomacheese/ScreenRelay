@@ -178,6 +178,131 @@ static void test_invalid_rtsp_url_prefix_fails() {
     printf("[PASS] test_invalid_rtsp_url_prefix_fails\n");
 }
 
+/** @brief audio セクションが省略された場合は無効のままロードされること */
+static void test_audio_default_disabled() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(ok, "Config without audio section should still load");
+    VERIFY(cfg.audio.enabled == false);
+    printf("[PASS] test_audio_default_disabled\n");
+}
+
+/** @brief audio セクションが正しくパースされること */
+static void test_audio_parses_all_fields() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 },
+      "audio": {
+        "enabled": true,
+        "source": "capture",
+        "device_id": "{device-guid}",
+        "bitrate_kbps": 160,
+        "sample_rate": 44100,
+        "channels": 1
+      }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(ok, "Config with audio section should load");
+    VERIFY(cfg.audio.enabled == true);
+    VERIFY(cfg.audio.source == "capture");
+    VERIFY(cfg.audio.device_id == "{device-guid}");
+    VERIFY(cfg.audio.bitrate_kbps == 160);
+    VERIFY(cfg.audio.sample_rate == 44100);
+    VERIFY(cfg.audio.channels == 1);
+    printf("[PASS] test_audio_parses_all_fields\n");
+}
+
+/** @brief audio.source が不正な値の場合にエラーになること */
+static void test_audio_invalid_source_fails() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 },
+      "audio": { "enabled": true, "source": "microphone" }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(!ok, "Unsupported audio.source should fail validation");
+    printf("[PASS] test_audio_invalid_source_fails\n");
+}
+
+/** @brief audio.channels が 1/2 以外の場合にエラーになること */
+static void test_audio_invalid_channels_fails() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 },
+      "audio": { "enabled": true, "channels": 6 }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(!ok, "audio.channels other than 1/2 should fail validation");
+    printf("[PASS] test_audio_invalid_channels_fails\n");
+}
+
+/** @brief audio.bitrate_kbps が 0 以下の場合にエラーになること */
+static void test_audio_invalid_bitrate_fails() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 },
+      "audio": { "enabled": true, "bitrate_kbps": 0 }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(!ok, "audio.bitrate_kbps <= 0 should fail validation");
+    printf("[PASS] test_audio_invalid_bitrate_fails\n");
+}
+
+/** @brief audio.sample_rate が 0 以下の場合にエラーになること */
+static void test_audio_invalid_sample_rate_fails() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 },
+      "audio": { "enabled": true, "sample_rate": 0 }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(!ok, "audio.sample_rate <= 0 should fail validation");
+    printf("[PASS] test_audio_invalid_sample_rate_fails\n");
+}
+
+/** @brief 無効時は audio セクションが不正でも検証をスキップすること */
+static void test_audio_disabled_skips_validation() {
+    const std::string json = R"({
+      "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
+      "encoder": { "fps": 60, "bitrate_kbps": 4000 },
+      "audio": { "enabled": false, "source": "microphone", "channels": 6 }
+    })";
+    auto path = write_temp_config(json);
+    AppConfig cfg;
+    std::string err;
+    bool ok = ConfigLoader::load(path, cfg, err);
+    cleanup(path);
+    VERIFY_MSG(ok, "Disabled audio section should skip validation");
+    printf("[PASS] test_audio_disabled_skips_validation\n");
+}
+
 /**
  * @brief ConfigLoader のユニットテストを実行する
  * @return 成功時 0 (失敗時は VERIFY マクロにより exit(1))
@@ -192,5 +317,12 @@ int run_config_loader_tests() {
     test_invalid_fps_fails();
     test_invalid_rtsp_url_prefix_fails();
     test_invalid_backend_fails();
+    test_audio_default_disabled();
+    test_audio_parses_all_fields();
+    test_audio_invalid_source_fails();
+    test_audio_invalid_channels_fails();
+    test_audio_invalid_bitrate_fails();
+    test_audio_invalid_sample_rate_fails();
+    test_audio_disabled_skips_validation();
     return 0;
 }

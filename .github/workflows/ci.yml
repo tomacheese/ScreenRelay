@@ -161,7 +161,9 @@ jobs:
 
       - name: 🧪 Run unit tests
         shell: msys2 {0}
-        run: ./build/tests/screen_relay_tests.exe
+        run: |
+          export PATH="$PWD/deps/ffmpeg/bin:$PATH"
+          ./build/tests/screen_relay_tests.exe
 
       - name: 📦 Package binary
         shell: msys2 {0}

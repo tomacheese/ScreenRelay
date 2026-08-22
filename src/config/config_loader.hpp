@@ -26,6 +26,7 @@ struct AppConfig {
 
     EncoderConfig encoder;  ///< エンコーダー設定
     RtspConfig    rtsp;     ///< RTSP 配信設定
+    AudioConfig   audio;    ///< 音声配信設定
 
     /** @brief ランタイム動作設定 */
     struct Runtime {

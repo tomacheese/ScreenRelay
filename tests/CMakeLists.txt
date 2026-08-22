@@ -7,6 +7,7 @@ add_executable(screen_relay_tests
     unit/test_backoff.cpp
     unit/test_metrics_store.cpp
     unit/test_monitor_detector.cpp
+    unit/test_audio_pipeline.cpp
 )
 
 target_link_libraries(screen_relay_tests PRIVATE screen_relay_lib)

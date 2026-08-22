@@ -4,6 +4,7 @@
 extern "C" {
 #include <libavformat/avformat.h>
 #include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
 #include <libavutil/opt.h>
 #include <libavutil/mathematics.h>
 #include <libavutil/time.h>
@@ -20,7 +21,9 @@ extern "C" {
 struct RtspPublisherClient::Impl {
     AVFormatContext* fmt_ctx      = nullptr;  ///< フォーマットコンテキスト
     AVStream*        video_stream = nullptr;  ///< ビデオストリーム
-    AVPacket*        pkt          = nullptr;  ///< 再利用可能なパケット
+    AVStream*        audio_stream = nullptr;  ///< 音声ストリーム (未使用時は nullptr)
+    AVPacket*        pkt          = nullptr;  ///< 再利用可能なパケット (ビデオ用)
+    AVPacket*        audio_pkt    = nullptr;  ///< 再利用可能なパケット (音声用)
     int              fps          = 60;       ///< フレームレート (タイムスタンプ変換用)
 };
 
@@ -32,7 +35,8 @@ RtspPublisherClient::~RtspPublisherClient() { disconnect(); }
 bool RtspPublisherClient::connect(const std::string& url,
                                    const RtspConfig& config,
                                    const EncoderController::CodecInfo& codec_info,
-                                   std::string& error) {
+                                   std::string& error,
+                                   const AudioCodecInfo* audio_info) {
     disconnect();
 
     avformat_network_init();
@@ -78,6 +82,40 @@ bool RtspPublisherClient::connect(const std::string& url,
             static_cast<int>(codec_info.extradata.size());
     }
 
+    // 音声ストリームを追加する (audio_info が渡された場合のみ)
+    AVStream* audio_st = nullptr;
+    if (audio_info) {
+        audio_st = avformat_new_stream(fmt_ctx, nullptr);
+        if (!audio_st) {
+            avformat_free_context(fmt_ctx);
+            error = "avformat_new_stream (audio) failed";
+            return false;
+        }
+
+        audio_st->id                        = 1;
+        audio_st->codecpar->codec_type       = AVMEDIA_TYPE_AUDIO;
+        audio_st->codecpar->codec_id         = static_cast<AVCodecID>(audio_info->codec_id);
+        audio_st->codecpar->sample_rate      = audio_info->sample_rate;
+        audio_st->codecpar->bit_rate         = audio_info->bit_rate;
+        av_channel_layout_default(&audio_st->codecpar->ch_layout, audio_info->channels);
+        audio_st->time_base                  = {audio_info->time_base_num, audio_info->time_base_den};
+
+        if (!audio_info->extradata.empty()) {
+            audio_st->codecpar->extradata = static_cast<uint8_t*>(
+                av_mallocz(audio_info->extradata.size() + AV_INPUT_BUFFER_PADDING_SIZE));
+            if (!audio_st->codecpar->extradata) {
+                avformat_free_context(fmt_ctx);
+                error = "Failed to allocate audio codec extradata buffer";
+                return false;
+            }
+            std::memcpy(audio_st->codecpar->extradata,
+                        audio_info->extradata.data(),
+                        audio_info->extradata.size());
+            audio_st->codecpar->extradata_size =
+                static_cast<int>(audio_info->extradata.size());
+        }
+    }
+
     // RTCP SR のウォールクロック基点を PTS=0 に対応する実時刻に設定する。
     // 再接続時は最初のフレームの時刻 (stream_start_us) を使うことで、
     // PTS が frame_count ベースでなく実キャプチャ時刻ベースになった後も
@@ -107,16 +145,21 @@ bool RtspPublisherClient::connect(const std::string& url,
 
     impl_->fmt_ctx      = fmt_ctx;
     impl_->video_stream = st;
+    impl_->audio_stream = audio_st;
     impl_->fps          = codec_info.fps;
     connected_.store(true);
 
     // パケット送信ごとのヒープ割り当てを避けるため再利用可能な AVPacket を確保する
     impl_->pkt = av_packet_alloc();
-    if (!impl_->pkt) {
+    impl_->audio_pkt = audio_st ? av_packet_alloc() : nullptr;
+    if (!impl_->pkt || (audio_st && !impl_->audio_pkt)) {
         avio_closep(&impl_->fmt_ctx->pb);
         avformat_free_context(impl_->fmt_ctx);
         impl_->fmt_ctx = nullptr;
         impl_->video_stream = nullptr;
+        impl_->audio_stream = nullptr;
+        av_packet_free(&impl_->pkt);
+        av_packet_free(&impl_->audio_pkt);
         connected_.store(false);
         error = "Failed to allocate reusable AVPacket";
         return false;
@@ -164,6 +207,40 @@ bool RtspPublisherClient::send_packet(const EncodedPacket& pkt) {
     return true;
 }
 
+bool RtspPublisherClient::send_audio_packet(const EncodedPacket& pkt) {
+    if (!connected_.load() || !impl_->fmt_ctx || !impl_->audio_stream || !impl_->audio_pkt)
+        return false;
+
+    AVPacket* av_pkt = impl_->audio_pkt;
+    av_packet_unref(av_pkt);  // 前回のデータバッファを解放する (未使用時は no-op)
+
+    int ret = av_new_packet(av_pkt, static_cast<int>(pkt.data.size()));
+    if (ret < 0) { return false; }
+
+    std::memcpy(av_pkt->data, pkt.data.data(), pkt.data.size());
+    av_pkt->pts          = pkt.pts;
+    av_pkt->dts          = pkt.dts;
+    av_pkt->duration     = pkt.duration;
+    av_pkt->stream_index = impl_->audio_stream->index;
+    av_pkt->flags       |= AV_PKT_FLAG_KEY;  // AAC は全フレームが独立デコード可能
+
+    AVRational enc_tb = {pkt.time_base_num, pkt.time_base_den};
+    av_packet_rescale_ts(av_pkt, enc_tb, impl_->audio_stream->time_base);
+
+    ret = av_interleaved_write_frame(impl_->fmt_ctx, av_pkt);
+
+    if (ret < 0) {
+        connected_.store(false);
+        return false;
+    }
+
+    return true;
+}
+
+bool RtspPublisherClient::has_audio_stream() const {
+    return impl_->audio_stream != nullptr;
+}
+
 void RtspPublisherClient::disconnect() {
     if (!impl_->fmt_ctx) return;
 
@@ -179,9 +256,12 @@ void RtspPublisherClient::disconnect() {
     avformat_free_context(impl_->fmt_ctx);
     impl_->fmt_ctx      = nullptr;
     impl_->video_stream = nullptr;
+    impl_->audio_stream = nullptr;
 
     av_packet_free(&impl_->pkt);
     impl_->pkt = nullptr;
+    av_packet_free(&impl_->audio_pkt);
+    impl_->audio_pkt = nullptr;
 
     connected_.store(false);
 }

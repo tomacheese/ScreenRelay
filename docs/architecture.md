@@ -72,6 +72,9 @@ screen-relay は、Windows の DXGI Desktop Duplication API を使用して複�
 | ログ | `LogSink` | spdlog ベース JSON Lines ログ（ファイル＋コンソール） |
 | 設定 | `ConfigLoader` | nlohmann/json による設定ロード・バリデーション |
 | モニター検出 | `MonitorDetector` | EnumDisplayMonitors によるモニター一覧取得 |
+| 音声キャプチャ | `WasapiAudioCapture` | WASAPI によるループバック/録音デバイスからの PCM 取得 |
+| 音声エンコーダー | `AudioEncoderController` | FFmpeg AAC エンコード、libswresample によるリサンプリング |
+| 音声パイプライン | `AudioPipeline` | 共有キャプチャ→エンコードスレッド、全 ScreenPipeline へのブロードキャスト |
 
 ---
 
@@ -165,6 +168,37 @@ ScreenPipeline (primary=true)
 **プライマリ切替時の追従**: モニター電源断・切断などでプライマリが別モニターへ移った場合、
 `MonitorSupervisor::apply_monitor_changes()` が `is_primary` の変化を検知して影響するパイプラインを
 再生成します。`monitor_check_interval_ms`（デフォルト 1 秒）以内に `/screen0` が新プライマリへ追従します。
+
+---
+
+## 音声パイプライン（`audio.enabled: true` の場合）
+
+`audio.enabled` が有効な場合、`MonitorSupervisor` は **モニター数に関係なく単一の** `AudioPipeline` インスタンスを生成し、`WasapiAudioCapture` → `AudioEncoderController`（AAC）のキャプチャ・エンコードをバックグラウンドスレッドで実行します。エンコード済みパケットは購読中の全 `ScreenPipeline` へブロードキャストされ、各モニターの RTSP ストリーム（`/screen1`, `/screen2`, ... `/screen0` 含む）に同一の音声として配信されます。
+
+```text
+┌───────────────────────────────────────────────┐
+│  AudioPipeline (単一インスタンス、モニター非依存)   │
+│  WasapiAudioCapture → AudioEncoderController   │
+│  (WASAPI PCM)          (FFmpeg AAC)            │
+└───────────────────────┬───────────────────────┘
+                         │ ブロードキャスト
+        ┌────────────────┼────────────────┐
+        ▼                ▼                ▼
+AudioSubscriberQueue  AudioSubscriberQueue  ...
+        │                │
+        ▼                ▼
+ScreenPipeline(1)    ScreenPipeline(2)   ...
+  └ RtspPublisherClient (映像+音声)
+```
+
+### 音声 pts の再計算
+
+音声パイプラインは全モニターで共有されるため、`EncodedPacket` には単一基準の pts ではなく `capture_timestamp_us`（絶対キャプチャ時刻、UNIX エポック起点）が設定されます。各 `ScreenPipeline` は自身の RTSP 接続開始時刻（`connect_wallclock_us`、映像の `start_time_realtime` と同一の基準）を用いて、送信直前に `capture_timestamp_us` から接続固有の pts を再計算します。これにより、RTCP SR の NTP-RTP 対応が映像・音声で一貫します。
+
+### 障害時の扱い
+
+- 音声デバイスの取得・AAC エンコーダーの初期化に失敗した場合、`MonitorSupervisor::init()` はエラーをログに記録し、音声なしで映像配信を継続します
+- 音声キャプチャデバイスが失われた場合（デバイス切断等）、`AudioPipeline` は音声配信のみを停止します。映像パイプラインには影響しません
 
 ---
 

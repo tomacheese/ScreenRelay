@@ -29,6 +29,20 @@ static void parse_encoder(const json& j, EncoderConfig& cfg) {
 }
 
 /**
+ * @brief audio セクションを JSON からパースする
+ * @param j   JSON オブジェクト
+ * @param cfg 出力先の音声設定
+ */
+static void parse_audio(const json& j, AudioConfig& cfg) {
+    if (j.contains("enabled"))       cfg.enabled       = j["enabled"].get<bool>();
+    if (j.contains("source"))        cfg.source        = j["source"].get<std::string>();
+    if (j.contains("device_id"))     cfg.device_id      = j["device_id"].get<std::string>();
+    if (j.contains("bitrate_kbps"))  cfg.bitrate_kbps   = j["bitrate_kbps"].get<int>();
+    if (j.contains("sample_rate"))   cfg.sample_rate    = j["sample_rate"].get<int>();
+    if (j.contains("channels"))      cfg.channels       = j["channels"].get<int>();
+}
+
+/**
  * @brief rtsp セクションを JSON からパースする
  * @param j   JSON オブジェクト
  * @param cfg 出力先の RTSP 設定
@@ -84,6 +98,9 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
 
         // rtsp セクション
         if (j.contains("rtsp")) parse_rtsp(j["rtsp"], out.rtsp);
+
+        // audio セクション（省略時は無効のまま）
+        if (j.contains("audio")) parse_audio(j["audio"], out.audio);
 
         // runtime セクション
         if (j.contains("runtime")) {
@@ -159,6 +176,27 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
     if (out.rtsp.reconnect_backoff_multiplier < 1.0f) {
         error = "rtsp.reconnect_backoff_multiplier must be >= 1.0";
         return false;
+    }
+
+    // 音声設定のチェック（無効時はスキップ）
+    if (out.audio.enabled) {
+        AudioSourceKind source_kind;
+        if (!parse_audio_source_kind(out.audio.source, source_kind)) {
+            error = "audio.source must be \"loopback\" or \"capture\"";
+            return false;
+        }
+        if (out.audio.bitrate_kbps <= 0) {
+            error = "audio.bitrate_kbps must be positive";
+            return false;
+        }
+        if (out.audio.sample_rate <= 0) {
+            error = "audio.sample_rate must be positive";
+            return false;
+        }
+        if (out.audio.channels != 1 && out.audio.channels != 2) {
+            error = "audio.channels must be 1 or 2";
+            return false;
+        }
     }
 
     // ランタイム間隔の正値チェック

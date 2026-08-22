@@ -32,12 +32,14 @@ public:
      * @param config     RTSP 設定 (タイムアウト等)
      * @param codec_info エンコーダーのコーデック情報
      * @param error      エラーメッセージ出力先
+     * @param audio_info 音声コーデック情報 (nullptr の場合は音声ストリームを追加しない)
      * @return 成功した場合 true
      */
     bool connect(const std::string& url,
                  const RtspConfig& config,
                  const EncoderController::CodecInfo& codec_info,
-                 std::string& error);
+                 std::string& error,
+                 const AudioCodecInfo* audio_info = nullptr);
 
     /**
      * @brief エンコード済みパケットを送信する
@@ -45,6 +47,23 @@ public:
      * @return 成功した場合 true。失敗時は is_connected() が false になる
      */
     bool send_packet(const EncodedPacket& pkt);
+
+    /**
+     * @brief エンコード済み音声パケットを送信する
+     *
+     * connect() に audio_info を渡していない場合は何もせず false を返す。
+     *
+     * @param pkt 送信する音声パケット (pts/dts は呼び出し元が
+     *            音声ストリームのタイムベースに合わせて設定済みであること)
+     * @return 成功した場合 true。失敗時は is_connected() が false になる
+     */
+    bool send_audio_packet(const EncodedPacket& pkt);
+
+    /**
+     * @brief 音声ストリームが有効かどうかを返す
+     * @return connect() で音声ストリームを追加した場合 true
+     */
+    bool has_audio_stream() const;
 
     /**
      * @brief RTSP 接続を切断してリソースを解放する

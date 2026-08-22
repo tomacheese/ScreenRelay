@@ -64,6 +64,9 @@ set(LIB_SOURCES
     src/rtsp/rtsp_publisher_client.cpp
     src/metrics/metrics_store.cpp
     src/logging/log_sink.cpp
+    src/audio/audio_capture.cpp
+    src/audio/audio_encoder.cpp
+    src/audio/audio_pipeline.cpp
 )
 
 add_library(screen_relay_lib STATIC ${LIB_SOURCES})
@@ -90,6 +93,7 @@ target_link_libraries(screen_relay_lib PUBLIC
     d3dcompiler
     ws2_32
     user32
+    ole32
 )
 
 if(FFMPEG_LIBRARY_DIRS)

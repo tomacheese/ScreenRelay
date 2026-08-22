@@ -13,6 +13,7 @@
 #include "capture/frame_pump.hpp"
 #include "encoder/encoder_controller.hpp"
 #include "rtsp/rtsp_publisher_client.hpp"
+#include "audio/audio_pipeline.hpp"
 #include <atomic>
 #include <map>
 #include <memory>
@@ -42,7 +43,8 @@ public:
      */
     ScreenPipeline(const MonitorInfo& info, const AppConfig& config,
                    std::shared_ptr<LogSink> log,
-                   std::shared_ptr<MetricsStore> metrics);
+                   std::shared_ptr<MetricsStore> metrics,
+                   std::shared_ptr<AudioPipeline> audio_pipeline = nullptr);
 
     /**
      * @brief デストラクタ
@@ -184,6 +186,11 @@ private:
     std::unique_ptr<EncoderController>            encoder_;          ///< エンコーダー
     std::vector<std::unique_ptr<RtspPublisherClient>> rtsp_clients_; ///< RTSP クライアントリスト
 
+    std::shared_ptr<AudioPipeline>         audio_pipeline_;  ///< 共有音声パイプライン (無効時は nullptr)
+    std::shared_ptr<AudioSubscriberQueue>  audio_queue_;     ///< 音声パケット購読キュー (無効時は nullptr)
+    int64_t audio_stream_start_us_ = 0;   ///< 音声 pts 再計算の基準時刻 (RTSP 接続開始時刻)
+    int64_t last_audio_pts_        = -1;  ///< 直近送信した音声 pts（単調増加保証用）
+
     StateMachine  state_machine_;              ///< パイプラインステートマシン
     std::thread   pipeline_thread_;            ///< パイプラインスレッド
 
@@ -276,6 +283,7 @@ private:
     AppConfig config_;                          ///< アプリケーション設定
     std::shared_ptr<LogSink>      log_;         ///< ログシンク
     std::shared_ptr<MetricsStore> metrics_;     ///< メトリクスストア
+    std::shared_ptr<AudioPipeline> audio_pipeline_;  ///< 共有音声パイプライン (config.audio.enabled が false、または start() 失敗時は nullptr)
 
     std::map<std::string, std::unique_ptr<ScreenPipeline>> pipelines_;  ///< stable_id→パイプラインのマップ
     std::mutex pipelines_mutex_;                                         ///< パイプラインマップ保護用 mutex

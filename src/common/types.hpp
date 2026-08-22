@@ -97,6 +97,17 @@ struct EncodedPacket {
     bool is_key_frame   = false; ///< キーフレームフラグ
     int  time_base_num  = 1;     ///< タイムベース分子
     int  time_base_den  = 60;    ///< タイムベース分母
+
+    /**
+     * @brief 音声パケットの絶対キャプチャ時刻 (μs, UNIX エポック起点)
+     *
+     * 音声パイプラインは全モニターの RTSP ストリームで共有されるため、
+     * パケット自体の pts は単一の基準（エンコード開始時刻）に基づく。
+     * 各 ScreenPipeline は自身の RTSP 接続開始時刻を基準にこの値から
+     * pts を再計算し、RTCP SR の NTP-RTP 対応を維持する。
+     * 映像パケットでは未使用（0 のまま）。
+     */
+    int64_t capture_timestamp_us = 0;
 };
 
 /**
@@ -114,6 +125,85 @@ struct EncoderConfig {
     std::string preset = "fast";   ///< エンコードプリセット
     std::string tune   = "zerolatency";  ///< チューニングオプション
     int threads        = 0;        ///< エンコードスレッド数 (0=自動)
+};
+
+/**
+ * @brief 音声キャプチャの取得元種別
+ */
+enum class AudioSourceKind {
+    Loopback,  ///< レンダリングデバイスのループバック（システム再生音）
+    Capture    ///< 録音デバイス（マイク等の入力）
+};
+
+/**
+ * @brief AudioConfig::source 文字列を AudioSourceKind へ変換する
+ *
+ * 設定ファイルのバリデーション（config_loader）と実際のデバイス選択
+ * （audio_capture）の両方から呼び出し、判定基準を一本化する。
+ *
+ * @param source "loopback" または "capture"
+ * @param[out] out 変換結果（変換に失敗した場合は変更しない）
+ * @return "loopback"/"capture" のいずれかであれば true、それ以外は false
+ */
+inline bool parse_audio_source_kind(const std::string& source, AudioSourceKind& out) {
+    if (source == "loopback") { out = AudioSourceKind::Loopback; return true; }
+    if (source == "capture")  { out = AudioSourceKind::Capture;  return true; }
+    return false;
+}
+
+/**
+ * @brief 音声設定
+ *
+ * 映像ストリームに音声を乗せるかどうか、およびキャプチャ元デバイスを制御する。
+ */
+struct AudioConfig {
+    bool enabled            = false;       ///< 音声配信を有効にするか
+    std::string source      = "loopback";  ///< "loopback"（システム再生音）または "capture"（録音デバイス）
+    std::string device_id   = "";          ///< WASAPI エンドポイント ID。空の場合は既定デバイスを使用する
+    int bitrate_kbps        = 128;         ///< AAC エンコードビットレート (kbps)
+    int sample_rate         = 48000;       ///< エンコード後のサンプルレート (Hz)
+    int channels            = 2;           ///< エンコード後のチャンネル数
+};
+
+/**
+ * @brief 音声キャプチャしたバッファ
+ *
+ * インターリーブド PCM（IEEE float 32-bit）を保持する。
+ */
+struct AudioBuffer {
+    std::vector<uint8_t> data;    ///< インターリーブド PCM データ
+    uint32_t frame_count = 0;     ///< サンプルフレーム数（全チャンネル共通）
+};
+
+/**
+ * @brief 音声フレームメタデータ
+ */
+struct AudioMeta {
+    int64_t timestamp_us = 0;  ///< キャプチャ時刻 (μs, UNIX エポック起点)
+};
+
+/**
+ * @brief 音声デバイス情報
+ */
+struct AudioDeviceInfo {
+    std::string id;          ///< WASAPI エンドポイント ID
+    std::string name;        ///< フレンドリ名
+    bool        is_render = false;  ///< レンダリング（再生）デバイスなら true、録音デバイスなら false
+};
+
+/**
+ * @brief 音声エンコーダーのコーデック情報
+ *
+ * RtspPublisherClient::connect() に渡して音声ストリームを構築するために使用する。
+ */
+struct AudioCodecInfo {
+    int codec_id      = 0;      ///< AVCodecID の値
+    int sample_rate   = 48000;  ///< サンプルレート (Hz)
+    int channels      = 2;      ///< チャンネル数
+    int bit_rate      = 0;      ///< ビットレート (bps)
+    int time_base_num = 1;      ///< タイムベース分子
+    int time_base_den = 48000;  ///< タイムベース分母（通常サンプルレートと同じ）
+    std::vector<uint8_t> extradata;  ///< AudioSpecificConfig 等のエクストラデータ
 };
 
 /**

@@ -1,6 +1,8 @@
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include "metrics/metrics_store.hpp"
 #include "test_utils.hpp"
@@ -13,6 +15,18 @@ struct TempFileGuard {
     std::string path;
     explicit TempFileGuard(std::string p) : path(std::move(p)) {}
     ~TempFileGuard() { std::remove(path.c_str()); }
+};
+
+namespace fs = std::filesystem;
+
+/** @brief スコープ終了時にディレクトリを再帰的に削除する RAII ガード */
+struct DirGuard {
+    std::string path;
+    explicit DirGuard(std::string p) : path(std::move(p)) {}
+    ~DirGuard() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
 };
 
 /** @brief モニター 1 のメトリクスを設定して JSON に保存できること */
@@ -159,6 +173,90 @@ static void test_counters() {
     printf("[PASS] test_counters\n");
 }
 
+/** @brief 既存ファイルを繰り返し置換しても常に有効な JSON が読め、一時ファイルが残らないこと */
+static void test_save_replaces_existing_file() {
+    MetricsStore ms;
+    ms.set_state(1, "STREAMING");
+
+    std::string path = "test_metrics_replace_tmp.json";
+    TempFileGuard guard(path);
+    TempFileGuard tmp_guard(path + ".tmp");
+
+    for (int i = 0; i < 20; ++i) {
+        ms.increment_frames_received(1);
+        VERIFY_MSG(ms.save_metrics(path), "save_metrics should succeed when file exists");
+
+        std::ifstream f(path);
+        VERIFY_MSG(f.is_open(), "metrics file should exist after replace");
+        // 空や途中までのファイルでも例外ではなく VERIFY_MSG で失敗を報告する
+        nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+        VERIFY_MSG(!j.is_discarded(), "metrics file should be valid JSON after replace");
+        VERIFY_MSG(j["monitors"]["1"]["frames_received"] == i + 1,
+                   "metrics file should hold the latest content");
+
+        std::ifstream t(path + ".tmp");
+        VERIFY_MSG(!t.is_open(), "temporary file should not remain");
+    }
+
+    printf("[PASS] test_save_replaces_existing_file\n");
+}
+
+/** @brief 書き込み先の親パスが不正な場合 (置換の前段で失敗する場合) に旧ファイルが維持されること */
+static void test_save_invalid_parent_keeps_old_file() {
+    MetricsStore ms;
+    ms.set_state(1, "STREAMING");
+
+    std::string path = "test_metrics_keep_tmp.json";
+    TempFileGuard guard(path);
+    TempFileGuard tmp_guard(path + ".tmp");
+    VERIFY_MSG(ms.save_metrics(path), "initial save_metrics should succeed");
+
+    std::string before;
+    {
+        std::ifstream f(path);
+        before.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+
+    // 既存ファイルをディレクトリのように扱わせ、置換の前段 (親ディレクトリの作成) で失敗させる
+    std::string bad_path = path + "/child.json";
+    VERIFY_MSG(!ms.save_metrics(bad_path), "save_metrics to an invalid path should fail");
+
+    std::string after;
+    {
+        std::ifstream f(path);
+        VERIFY_MSG(f.is_open(), "old metrics file should be kept after failed save");
+        after.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    VERIFY_MSG(before == after, "old metrics file content should be unchanged");
+
+    printf("[PASS] test_save_invalid_parent_keeps_old_file\n");
+}
+
+/** @brief リネーム/置換そのものが失敗しても一時ファイルが掃除され、既存の内容が維持されること */
+static void test_save_replace_failure_cleans_tmp() {
+    MetricsStore ms;
+    ms.set_state(1, "STREAMING");
+
+    // 書き込み先をディレクトリにすると、一時ファイルの書き込みは成功し、置換だけが失敗する
+    std::string path = "test_metrics_dir_tmp.json";
+    std::error_code ec;
+    fs::remove_all(path, ec);
+    VERIFY_MSG(fs::create_directories(path), "test directory should be created");
+    DirGuard guard(path);
+    {
+        std::ofstream sentinel(fs::path(path) / "sentinel.txt");
+        sentinel << "keep";
+    }
+
+    VERIFY_MSG(!ms.save_metrics(path), "save_metrics should fail when replace fails");
+
+    VERIFY_MSG(!fs::exists(path + ".tmp"), "temporary file should be removed after replace failure");
+    VERIFY_MSG(fs::is_directory(path), "existing destination should be kept after replace failure");
+    VERIFY_MSG(fs::exists(fs::path(path) / "sentinel.txt"), "existing destination content should be kept");
+
+    printf("[PASS] test_save_replace_failure_cleans_tmp\n");
+}
+
 /**
  * @brief MetricsStore のユニットテストを実行する
  * @return 成功時 0 (失敗時は VERIFY マクロにより exit(1))
@@ -170,5 +268,8 @@ int run_metrics_tests() {
     test_health_streaming_is_healthy();
     test_health_fatal_is_unhealthy();
     test_counters();
+    test_save_replaces_existing_file();
+    test_save_invalid_parent_keeps_old_file();
+    test_save_replace_failure_cleans_tmp();
     return 0;
 }

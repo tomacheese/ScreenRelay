@@ -186,15 +186,14 @@ static void test_save_replaces_existing_file() {
         ms.increment_frames_received(1);
         VERIFY_MSG(ms.save_metrics(path), "save_metrics should succeed when file exists");
 
-        // 置換後も常にファイルが存在し、JSON として解析できること
         std::ifstream f(path);
         VERIFY_MSG(f.is_open(), "metrics file should exist after replace");
-        nlohmann::json j;
-        f >> j;
+        // 空や途中までのファイルでも例外ではなく VERIFY_MSG で失敗を報告する
+        nlohmann::json j = nlohmann::json::parse(f, nullptr, false);
+        VERIFY_MSG(!j.is_discarded(), "metrics file should be valid JSON after replace");
         VERIFY_MSG(j["monitors"]["1"]["frames_received"] == i + 1,
                    "metrics file should hold the latest content");
 
-        // 一時ファイルが残らないこと
         std::ifstream t(path + ".tmp");
         VERIFY_MSG(!t.is_open(), "temporary file should not remain");
     }
@@ -238,8 +237,7 @@ static void test_save_replace_failure_cleans_tmp() {
     MetricsStore ms;
     ms.set_state(1, "STREAMING");
 
-    // 書き込み先をディレクトリにすると、一時ファイルの書き込みは成功し、
-    // rename / MoveFileExW による置換だけが失敗する
+    // 書き込み先をディレクトリにすると、一時ファイルの書き込みは成功し、置換だけが失敗する
     std::string path = "test_metrics_dir_tmp.json";
     std::error_code ec;
     fs::remove_all(path, ec);

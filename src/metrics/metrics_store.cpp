@@ -141,12 +141,13 @@ std::string MetricsStore::build_health_json() const {
  * @brief ファイルをアトミックに書き込む
  *
  * 一時ファイルに書き込んだ後、既存ファイルを置換する形でリネームすることで
- * 書き込み途中の読み取りを防ぐ。置換の前に既存ファイルを削除しないため、
- * 置換に失敗しても旧ファイルは維持され、読み取り側がファイル不存在を
- * 観測することもない。失敗時は一時ファイルを削除する。
+ * 書き込み途中の読み取りを防ぐ。
+ * 置換の前に既存ファイルを削除しないため、置換に失敗しても旧ファイルは維持され、
+ * 読み取り側がファイル不存在を観測することもない。
+ * 失敗時は一時ファイルを削除する。
  *
- * 保証するのはファイル名の置換の原子性であり、電源断後の内容の永続性
- * (耐久性) は保証しない。
+ * 保証するのはファイル名の置換の原子性であり、
+ * 電源断後の内容の永続性 (耐久性) は保証しない。
  * @param path    書き込み先パス
  * @param content 書き込む内容
  * @return 成功時 true
@@ -157,18 +158,20 @@ static bool write_atomic(const std::string& path, const std::string& content) {
         auto parent = fs::path(path).parent_path();
         if (!parent.empty())
             fs::create_directories(parent);
+        bool written = false;
         {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
-            if (!f.is_open()) return false;
-            f << content;
-            // 暗黙の close() では失敗を検出できないため、置換の前に明示的に
-            // close() してストリーム状態を確認する
-            f.close();
-            if (f.fail()) {
-                std::error_code ec;
-                fs::remove(tmp, ec);
-                return false;
+            if (f.is_open()) {
+                f << content;
+                // 暗黙の close() では失敗を検出できないため、明示的に close() して確認する
+                f.close();
+                written = !f.fail();
             }
+        }
+        if (!written) {
+            std::error_code ec;
+            fs::remove(tmp, ec);
+            return false;
         }
 
         bool replaced = false;
@@ -178,7 +181,6 @@ static bool write_atomic(const std::string& path, const std::string& content) {
         replaced = MoveFileExW(fs::path(tmp).c_str(), fs::path(path).c_str(),
                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else
-        // POSIX の rename(2) は既存ファイルをアトミックに置換する
         std::error_code ec;
         fs::rename(tmp, path, ec);
         replaced = !ec;

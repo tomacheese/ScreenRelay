@@ -1,6 +1,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <string>
 #include "metrics/metrics_store.hpp"
 #include "test_utils.hpp"
@@ -159,6 +160,67 @@ static void test_counters() {
     printf("[PASS] test_counters\n");
 }
 
+/** @brief 既存ファイルを繰り返し置換しても常に有効な JSON が読め、一時ファイルが残らないこと */
+static void test_save_replaces_existing_file() {
+    MetricsStore ms;
+    ms.set_state(1, "STREAMING");
+
+    std::string path = "test_metrics_replace_tmp.json";
+    TempFileGuard guard(path);
+    TempFileGuard tmp_guard(path + ".tmp");
+
+    for (int i = 0; i < 20; ++i) {
+        ms.increment_frames_received(1);
+        VERIFY_MSG(ms.save_metrics(path), "save_metrics should succeed when file exists");
+
+        // 置換後も常にファイルが存在し、JSON として解析できること
+        std::ifstream f(path);
+        VERIFY_MSG(f.is_open(), "metrics file should exist after replace");
+        nlohmann::json j;
+        f >> j;
+        VERIFY_MSG(j["monitors"]["1"]["frames_received"] == i + 1,
+                   "metrics file should hold the latest content");
+
+        // 一時ファイルが残らないこと
+        std::ifstream t(path + ".tmp");
+        VERIFY_MSG(!t.is_open(), "temporary file should not remain");
+    }
+
+    printf("[PASS] test_save_replaces_existing_file\n");
+}
+
+/** @brief 置換に失敗しても旧ファイルが維持され、一時ファイルが残らないこと */
+static void test_save_failure_keeps_old_file() {
+    MetricsStore ms;
+    ms.set_state(1, "STREAMING");
+
+    std::string path = "test_metrics_keep_tmp.json";
+    TempFileGuard guard(path);
+    TempFileGuard tmp_guard(path + ".tmp");
+    VERIFY_MSG(ms.save_metrics(path), "initial save_metrics should succeed");
+
+    std::string before;
+    {
+        std::ifstream f(path);
+        before.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+
+    // 書き込み先に存在しないディレクトリ配下かつ作成不能なパスを指定して失敗させる:
+    // 既存ファイルをディレクトリのように扱わせる
+    std::string bad_path = path + "/child.json";
+    VERIFY_MSG(!ms.save_metrics(bad_path), "save_metrics to an invalid path should fail");
+
+    std::string after;
+    {
+        std::ifstream f(path);
+        VERIFY_MSG(f.is_open(), "old metrics file should be kept after failed save");
+        after.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+    }
+    VERIFY_MSG(before == after, "old metrics file content should be unchanged");
+
+    printf("[PASS] test_save_failure_keeps_old_file\n");
+}
+
 /**
  * @brief MetricsStore のユニットテストを実行する
  * @return 成功時 0 (失敗時は VERIFY マクロにより exit(1))
@@ -170,5 +232,7 @@ int run_metrics_tests() {
     test_health_streaming_is_healthy();
     test_health_fatal_is_unhealthy();
     test_counters();
+    test_save_replaces_existing_file();
+    test_save_failure_keeps_old_file();
     return 0;
 }

@@ -1,5 +1,6 @@
 #include <cstdio>
 #include <cstdlib>
+#include <filesystem>
 #include <fstream>
 #include <iterator>
 #include <string>
@@ -14,6 +15,18 @@ struct TempFileGuard {
     std::string path;
     explicit TempFileGuard(std::string p) : path(std::move(p)) {}
     ~TempFileGuard() { std::remove(path.c_str()); }
+};
+
+namespace fs = std::filesystem;
+
+/** @brief スコープ終了時にディレクトリを再帰的に削除する RAII ガード */
+struct DirGuard {
+    std::string path;
+    explicit DirGuard(std::string p) : path(std::move(p)) {}
+    ~DirGuard() {
+        std::error_code ec;
+        fs::remove_all(path, ec);
+    }
 };
 
 /** @brief モニター 1 のメトリクスを設定して JSON に保存できること */
@@ -189,8 +202,8 @@ static void test_save_replaces_existing_file() {
     printf("[PASS] test_save_replaces_existing_file\n");
 }
 
-/** @brief 置換に失敗しても旧ファイルが維持され、一時ファイルが残らないこと */
-static void test_save_failure_keeps_old_file() {
+/** @brief 書き込み先の親パスが不正な場合 (置換の前段で失敗する場合) に旧ファイルが維持されること */
+static void test_save_invalid_parent_keeps_old_file() {
     MetricsStore ms;
     ms.set_state(1, "STREAMING");
 
@@ -205,8 +218,7 @@ static void test_save_failure_keeps_old_file() {
         before.assign(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     }
 
-    // 書き込み先に存在しないディレクトリ配下かつ作成不能なパスを指定して失敗させる:
-    // 既存ファイルをディレクトリのように扱わせる
+    // 既存ファイルをディレクトリのように扱わせ、置換の前段 (親ディレクトリの作成) で失敗させる
     std::string bad_path = path + "/child.json";
     VERIFY_MSG(!ms.save_metrics(bad_path), "save_metrics to an invalid path should fail");
 
@@ -218,7 +230,33 @@ static void test_save_failure_keeps_old_file() {
     }
     VERIFY_MSG(before == after, "old metrics file content should be unchanged");
 
-    printf("[PASS] test_save_failure_keeps_old_file\n");
+    printf("[PASS] test_save_invalid_parent_keeps_old_file\n");
+}
+
+/** @brief リネーム/置換そのものが失敗しても一時ファイルが掃除され、既存の内容が維持されること */
+static void test_save_replace_failure_cleans_tmp() {
+    MetricsStore ms;
+    ms.set_state(1, "STREAMING");
+
+    // 書き込み先をディレクトリにすると、一時ファイルの書き込みは成功し、
+    // rename / MoveFileExW による置換だけが失敗する
+    std::string path = "test_metrics_dir_tmp.json";
+    std::error_code ec;
+    fs::remove_all(path, ec);
+    VERIFY_MSG(fs::create_directories(path), "test directory should be created");
+    DirGuard guard(path);
+    {
+        std::ofstream sentinel(fs::path(path) / "sentinel.txt");
+        sentinel << "keep";
+    }
+
+    VERIFY_MSG(!ms.save_metrics(path), "save_metrics should fail when replace fails");
+
+    VERIFY_MSG(!fs::exists(path + ".tmp"), "temporary file should be removed after replace failure");
+    VERIFY_MSG(fs::is_directory(path), "existing destination should be kept after replace failure");
+    VERIFY_MSG(fs::exists(fs::path(path) / "sentinel.txt"), "existing destination content should be kept");
+
+    printf("[PASS] test_save_replace_failure_cleans_tmp\n");
 }
 
 /**
@@ -233,6 +271,7 @@ int run_metrics_tests() {
     test_health_fatal_is_unhealthy();
     test_counters();
     test_save_replaces_existing_file();
-    test_save_failure_keeps_old_file();
+    test_save_invalid_parent_keeps_old_file();
+    test_save_replace_failure_cleans_tmp();
     return 0;
 }

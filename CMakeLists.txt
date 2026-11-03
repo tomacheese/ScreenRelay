@@ -6,7 +6,7 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(BUILD_TESTS "Build unit tests" ON)
 
-# FFmpeg (pkg-config 優先、なければ deps/ffmpeg/ を使用)
+# FFmpeg: prefer pkg-config, otherwise fall back to deps/ffmpeg/
 find_package(PkgConfig QUIET)
 if(PkgConfig_FOUND)
     pkg_check_modules(FFMPEG QUIET

@@ -1,358 +1,125 @@
-# screen-relay 設計書
+# screen-relay design
 
-## 1. 確定要件一覧
+This document records the requirements, design decisions and known constraints behind screen-relay.
+For the implemented structure see [architecture.md](./architecture.md) (components, data flow, thread model), [state-machine.md](./state-machine.md), [configuration.md](./configuration.md) and [metrics.md](./metrics.md).
 
-| カテゴリ | 項目 | 仕様 |
+---
+
+## 1. Requirements
+
+| Category | Item | Specification |
 |---|---|---|
-| 実行環境 | OS | Windows 11 (最新 LTS) |
-| 実行環境 | GPU | NVIDIA GPU オプション (存在すれば NVENC 使用) |
-| 実行環境 | ビルド | MSYS2 / MinGW-w64 (GCC 13+) |
-| キャプチャ | API | DXGI / WGC — 設定ファイルで切替 |
-| キャプチャ | カーソル | 非表示 (固定) |
-| キャプチャ | 解像度 | 論理解像度 (DPI スケーリング後) |
-| キャプチャ | フレームレート | 60 fps (設定可変) |
-| キャプチャ | 音声 | スコープ外 |
-| エンコード | コーデック | h264_nvenc → h264_mf → libx264 (モニター単位でフォールバック) |
-| エンコード | ビットレート | デフォルト 4000 kbps (設定可変) |
-| エンコード | GOP / B フレーム | GOP = FPS 値、B フレーム = 0 (低遅延固定) |
-| モニター | 最大台数 | 4 台 |
-| モニター | 番号体系 | Windows 設定アプリのディスプレイ番号 (\\.\DISPLAYn の n)。毎ポーリング再計算し Windows が再パックすれば 1 ポーリング以内に追従 |
-| モニター | プライマリ特例 | screen0 を追加エイリアスとして発行 → 常に現在のプライマリを指す、切替時に 1 ポーリング以内追従 |
-| モニター | 変更検知 | ポーリング (デフォルト 1 秒)、接続時に再開・切断時に停止 |
-| モニター | パイプライン管理 | CCD API (monitorDevicePath) による物理モニター安定 ID をキーとして管理 |
-| モニター | ミラー表示 | ソース画面のみ配信 |
-| 配信 | プロトコル | RTSP (ANNOUNCE/RECORD) |
-| 配信 | パスパターン | `/live/screen{n}` (設定可変) |
-| 配信 | 許容遅延 | ≤ 3 秒 |
-| 配信 | 再接続 | 指数バックオフ付き自動再接続 |
-| 障害対応 | GPU クラッシュ | キャプチャ・エンコード再初期化 |
-| ライブラリ | FFmpeg | 共有 LGPL ビルド (動的リンク) |
-| ログ | 形式 | JSON Lines (spdlog)、レベル設定可変 |
-| メトリクス | 出力 | FPS・遅延・ドロップ率 (JSON ファイル) |
-| UI | 形式 | CLI のみ |
-| 配布 | 形式 | exe + FFmpeg DLL 同梱 ZIP |
+| Runtime | OS | Windows 10 / 11 (x64) |
+| Runtime | GPU | NVIDIA GPU is optional (NVENC is used when available) |
+| Runtime | Build | MSYS2 / MinGW-w64 (GCC 13+), CMake 3.20+ |
+| Capture | API | DXGI Desktop Duplication (`capture.backend` accepts only `"dxgi"`) |
+| Capture | Cursor | Not composited into the frames |
+| Capture | Resolution | Logical resolution (after DPI scaling); a physical-resolution capture is downscaled with `sws_scale` (bilinear) when it differs |
+| Capture | Frame rate | 60 fps by default (`encoder.fps`, 1-240) |
+| Capture | Audio | Optional (`audio.enabled`, default off): WASAPI loopback or capture device, AAC, shared by all streams |
+| Encode | Codec | `h264_nvenc` → `h264_mf` → `libx264`, falling back per monitor |
+| Encode | Bitrate | 4000 kbps by default (`encoder.bitrate_kbps`) |
+| Encode | GOP / B-frames | GOP = FPS value, B-frames = 0 (fixed for low latency) |
+| Monitors | Count | Designed for up to 4 monitors (not enforced in code; the practical limit is the NVENC session limit, see R3) |
+| Monitors | Numbering | Windows Settings display number (the `n` in `\\.\DISPLAYn`), recomputed on every poll, so a renumbering by Windows is followed within one poll |
+| Monitors | Primary alias | The primary monitor is additionally published as `screen0`, which always points to the current primary and follows a primary change within one poll |
+| Monitors | Change detection | Polling (1 second by default); a connected monitor gets a pipeline, a disconnected one has its pipeline stopped |
+| Monitors | Pipeline key | Stable physical-monitor ID from the CCD API (`monitorDevicePath`) |
+| Monitors | Mirroring | Mirroring-driver devices are excluded; only the source display is published |
+| Delivery | Protocol | RTSP ANNOUNCE/RECORD over TCP (`rtsp_transport=tcp`) |
+| Delivery | Path pattern | `rtsp.path_pattern`, code default `/live/screen{n}` (`config/config.example.json` uses `/screen{n}`) |
+| Delivery | Latency target | 3 seconds or less (a design target; latency is not measured) |
+| Delivery | Reconnect | Automatic reconnect with exponential backoff |
+| Fault handling | GPU loss / DXGI hard error | Capture is re-initialized (`RECONFIGURING`); if that fails the pipeline goes to `FATAL` and the supervisor recreates it on the next poll |
+| Libraries | FFmpeg | Shared LGPL build (dynamic linking) |
+| Logging | Format | JSON Lines via spdlog (file with rotation, 10 MB × 5, plus console), configurable level |
+| Metrics | Output | `metrics.json` (state, resolution, fps, bitrate, codec, frame / error counters) and `health.json` |
+| UI | Form | CLI only |
+| Distribution | Form | ZIP with the exe and the FFmpeg DLLs |
 
 ---
 
-## 2. アーキテクチャ概要
+## 2. Design decisions
 
-```
-main()
-├── ConfigLoader          JSON 設定読込・バリデーション
-├── Logger                spdlog JSON Lines
-├── SignalHandler         Ctrl+C → グレースフルシャットダウン
-├── MetricsStore          スレッドセーフなカウンタ群
-└── MonitorSupervisor     全体オーケストレーター
-    ├── MonitorDetector   モニター変化検知スレッド
-    └── ScreenPipeline[]  モニターごとのパイプライン
-        ├── CaptureBackend    (DXGI or WGC)
-        ├── FramePump         キャプチャスレッド + 境界キュー
-        ├── EncoderController FFmpeg H.264 エンコーダー
-        ├── RtspPublisher[0]  /live/screen{n}
-        └── RtspPublisher[1]  /live/screen0 (プライマリのみ)
-```
+### 2.1 Monitor identity and RTSP paths
 
-### データフロー
+- Monitors are enumerated with `EnumDisplayMonitors()` every `runtime.monitor_check_interval_ms`; the number is extracted from `MONITORINFOEX.szDevice` (`\\.\DISPLAY2` → 2) and the primary flag from `MONITORINFOF_PRIMARY`, both re-evaluated on every poll.
+- Mirroring-driver devices are skipped via the `DISPLAY_DEVICE_MIRRORING_DRIVER` flag of `EnumDisplayDevices()`.
+- The stable ID (`MonitorInfo::stable_id`) is the CCD `monitorDevicePath`, obtained with `QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` + `DisplayConfigGetDeviceInfo`.
+  When the CCD lookup fails, `device_name` is used instead.
+- `MonitorSupervisor::pipelines_` is keyed by `stable_id`, so a number repack by Windows does not break the mapping between a physical monitor and its pipeline.
+- `apply_monitor_changes()` handles these cases:
 
-```
-[モニター (GPU テクスチャ)]
-  ↓ CaptureBackend::acquire_frame()
-[FrameBuffer (BGRA, 論理解像度)]
-  ↓ FramePump → bounded queue (max 4)
-[EncoderController::encode()]
-  sws_scale: BGRA → NV12/YUV420P
-  avcodec: → H.264 NAL packets
-[EncodedPacket]
-  ↓ fan-out
-[RtspPublisher::send()] × 1 or 2
-  RTSP ANNOUNCE/RECORD → MediaMTX
-```
-
----
-
-## 3. コンポーネント詳細
-
-### 3.1 MonitorDetector
-
-- `EnumDisplayMonitors()` を `monitor_check_interval_ms` ごとにポーリング
-- 各 HMONITOR に対して `GetMonitorInfo()` → `MONITORINFOEX.szDevice` から番号抽出
-  - `\\.\DISPLAY2` → monitor_number = 2（Windows 設定ディスプレイ番号、毎ポーリング再計算）
-- `MONITORINFOF_PRIMARY` フラグでプライマリ判定（毎ポーリング再評価）
-- ミラー表示の除外: `EnumDisplayDevices()` で `DISPLAY_DEVICE_MIRRORING_DRIVER` フラグをチェック
-- CCD API (`QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS)` + `DisplayConfigGetDeviceInfo`) で物理モニター安定 ID (`monitorDevicePath`) を取得し `MonitorInfo::stable_id` に格納する
-  - CCD 失敗時は `device_name` をフォールバックとして使用する
-
-```
-モニター状態変化の種別:
-  ADDED          → ScreenPipeline 生成・起動
-  REMOVED        → ScreenPipeline 停止・破棄
-  RESIZED        → ScreenPipeline へ RECONFIGURING イベント送信
-  RETARGETED     → number/primary/handle 変化 → ScreenPipeline 停止・再生成
-                   (/screen0 プライマリ追従・screenN Settings 番号追従を保証)
-```
-
-#### パイプライン管理キー
-
-`MonitorSupervisor::pipelines_` のキーは `stable_id`（物理モニター単位で安定な ID）。
-これにより Windows がモニター番号を再パックしても、物理モニターとパイプラインの対応が崩れない。
-
-#### プライマリモニターの RTSP パス生成
-
-```
-primary monitor (\\.\DISPLAY2, Windows 番号 = 2)
-  → paths: ["/live/screen2", "/live/screen0"]
-
-non-primary monitor (\\.\DISPLAY1, Windows 番号 = 1)
-  → paths: ["/live/screen1"]
-```
-
-プライマリが別のモニターに移った場合（例: モニター電源断）、`apply_monitor_changes()` が
-number/is_primary/handle の変化を検知してパイプラインを再生成するため、`/screen0` は
-1 ポーリング以内に新プライマリの映像へ追従する。
-
-### 3.2 CaptureBackend インターフェース
-
-```cpp
-class ICaptureBackend {
-public:
-    /** モニターに対してバックエンドを初期化する */
-    virtual bool init(HMONITOR monitor, int logical_width, int logical_height) = 0;
-    /** 最新フレームを取得する。フレームがなければ nullopt */
-    virtual std::optional<FrameBuffer> acquire_frame(int timeout_ms) = 0;
-    /** 解像度変更を通知する */
-    virtual bool reconfigure(int new_width, int new_height) = 0;
-    virtual void release() = 0;
-};
-```
-
-#### DXGI バックエンド (DxgiCaptureBackend)
-
-- `IDXGIFactory1` → アダプター列挙 → HMONITOR と `IDXGIOutput` を照合
-- `IDXGIOutput1::DuplicateOutput` → `IDXGIOutputDuplication`
-- `AcquireNextFrame` → デスクトップテクスチャ → ステージングテクスチャにコピー → Map → CPU BGRA
-- 物理解像度で取得後、`sws_scale` で論理解像度にダウンスケール
-- マルチ GPU 環境対応: `EnumDisplayDevices` でモニターのアダプター特定
-
-#### WGC バックエンド (WgcCaptureBackend)
-
-- `GraphicsCaptureItem::CreateForMonitor(HMONITOR)` でモニターキャプチャアイテム生成
-- `Direct3D11CaptureFramePool` に論理解像度を直接指定 → スケーリング不要
-- フレームポーリングまたは `FrameArrived` コールバック
-- **リスク**: MinGW での C++/WinRT ヘッダー互換性 (→ 後述)
-
-### 3.3 FramePump
-
-- キャプチャスレッドで `CaptureBackend::acquire_frame()` をループ呼出
-- `std::queue<FrameBuffer>` + `std::mutex` + `std::condition_variable`
-- キューが満杯 (max 4) の場合は最古フレームを破棄してドロップカウント増加
-- FPS 計測をここで行う
-
-### 3.4 EncoderController
-
-SpoutRelay から移植・拡張:
-
-- フォールバックチェーン: `h264_nvenc` → `h264_mf` → `libx264`
-- 入力: BGRA (FrameBuffer)
-- `sws_scale`: BGRA → NV12 (NVENC) / YUV420P (libx264)
-- 低遅延設定: `max_b_frames=0`, `gop_size=fps`, `tune=zerolatency`
-- 解像度変更時: `avcodec_close` → 再初期化
-
-### 3.5 RtspPublisher
-
-SpoutRelay から移植・拡張:
-
-- RTSP ANNOUNCE/RECORD プロトコル (FFmpeg `avformat`)
-- `send(EncodedPacket)` を複数の Publisher が受け取るファンアウト構造
-- 独立した接続状態と指数バックオフ再接続
-- タイムスタンプ: `AV_TIME_BASE` 基準の単調増加
-
-### 3.6 ScreenPipeline ステートマシン
-
-```
-          +-------+
-     +--->| FATAL |
-     |    +-------+
-     |
-+--------+    +------------+    +-----------+    +-----------+
-|  INIT  |--->| CAPTURING  |--->| CONNECTING|--->| STREAMING |
-+--------+    +------------+    +-----------+    +-----------+
-                   ^                                  |   |
-                   |           +-----------+          |   |
-                   |           | RECONNECT |<---------+   |
-                   |           +-----------+              |
-                   |           +-------------+            |
-                   +-----------|RECONFIGURING|<-----------+
-                               +-------------+
-```
-
-| 状態 | 説明 |
+| Case | Action |
 |---|---|
-| INIT | CaptureBackend・Encoder 初期化 |
-| CAPTURING | フレーム取得中、RTSP 接続前 |
-| CONNECTING | RTSP ANNOUNCE/RECORD 送信中 |
-| STREAMING | 正常配信中 |
-| RECONNECTING | RTSP 再接続中 (指数バックオフ) |
-| RECONFIGURING | 解像度変更対応 → キャプチャ再初期化 |
-| STOPPING | グレースフルシャットダウン |
-| FATAL | 回復不能エラー (GPU クラッシュ後の再試行上限超え等) |
+| `stable_id` no longer present | Pipeline stopped and destroyed (`monitor_removed`) |
+| New `stable_id` | Pipeline created and started (`monitor_added`) |
+| Existing pipeline is `FATAL` | Pipeline stopped and recreated (`pipeline_restart`) |
+| `number` / `is_primary` / `handle` changed | Pipeline stopped and recreated (`pipeline_retarget`) |
+| Only the logical resolution changed | `notify_resized()`; the pipeline goes through `RECONFIGURING` |
+
+- The `/screen0` alias and the Settings-number paths are kept correct by the retarget case.
+  For example, the primary monitor `\\.\DISPLAY2` publishes to `/live/screen2` and `/live/screen0` (with the default `path_pattern`), a non-primary `\\.\DISPLAY1` only to `/live/screen1`.
+  If the primary moves to another monitor (for example because a monitor is powered off), both affected pipelines are recreated within one poll.
+
+### 2.2 Capture
+
+- `ICaptureBackend` (`src/capture/capture_backend.hpp`) abstracts the capture API; `DxgiCaptureBackend` is the only implementation.
+- DXGI: `IDXGIFactory1` → adapters → outputs, matching `IDXGIOutputDesc::Monitor` against the `HMONITOR`, so multi-GPU systems work without extra adapter lookup.
+  `IDXGIOutput1::DuplicateOutput` yields the duplication; each `AcquireNextFrame` result is copied to a staging texture and mapped to BGRA, or handed over as a GPU texture in zero-copy mode.
+- Desktop Duplication only delivers a frame when the screen changes.
+  A timeout is therefore normal, and `ScreenPipeline` re-encodes the last frame at the configured fps (freeze frame) so the stream does not stall on a static screen.
+- `FramePump` runs the capture loop on its own thread and keeps a bounded queue (4 frames); when full, the oldest frame is dropped.
+- A hard DXGI error (for example `ACCESS_LOST`) is reported separately from a timeout and sends the pipeline to `RECONFIGURING`.
+  Initialization is retried up to 15 times at 200 ms intervals, because `DuplicateOutput` may return `E_ACCESSDENIED` while the driver is updating after a resolution change.
+- GPU zero-copy: when the physical and logical resolutions match and the encoder is NVENC, the capture backend and the encoder share one D3D11 device and textures are passed to NVENC without CPU readback or `sws_scale`.
+  If the zero-copy path cannot be established, the CPU path is used with the same codec.
+
+### 2.3 Encoder
+
+- Fallback chain `encoder.codec` → `encoder.fallback_codecs`, evaluated per monitor each time an encoder is initialized.
+  A codec is skipped when FFmpeg does not provide it or `avcodec_open2` fails.
+- CPU path: `sws_scale` BGRA → `YUV420P` (preferred) or `NV12`, chosen from the codec's pixel formats.
+  The conversion is skipped for repeated freeze frames.
+- Low-latency settings: `max_b_frames`, `gop_size` from the config; `tune` (`zerolatency`) only for software encoders (`libx264`); `rc=cbr` and `delay=0` for NVENC.
+- On a resolution change the encoder is flushed, destroyed and created again (the pipeline passes through `RECONFIGURING` → `CAPTURING` → `CONNECTING`).
+
+### 2.4 RTSP publishing
+
+- `RtspPublisherClient` (FFmpeg `avformat`, RTSP muxer) publishes one stream; the primary monitor's pipeline owns two clients (`screen{n}` and `screen0`) fed with the same `EncodedPacket`s.
+  If sending to either client fails, the pipeline goes to `RECONNECTING` and reconnects both.
+- Reconnect uses exponential backoff (`rtsp.reconnect_delay_ms`, `rtsp.reconnect_max_delay_ms`, `rtsp.reconnect_backoff_multiplier`); after a successful reconnect an IDR frame is requested.
+- Video PTS is derived from the capture wall-clock time (not a frame counter), and `start_time_realtime` is set so that RTCP SR carries a consistent NTP-RTP mapping.
+  The shared audio stream's PTS is recomputed per connection from the same base.
 
 ---
 
-## 4. スレッドモデル
+## 3. Technical risks and mitigations
 
-| スレッド | 数 | 役割 |
-|---|---|---|
-| メインスレッド | 1 | シグナル処理、MonitorSupervisor ループ |
-| MonitorDetector | 1 | EnumDisplayMonitors ポーリング |
-| キャプチャスレッド | モニター数 | CaptureBackend → FramePump |
-| エンコード+送信スレッド | モニター数 | FramePump → Encoder → RtspPublisher |
-| メトリクス書込スレッド | 1 | health.json / metrics.json を定期書込 |
+### R1: DXGI on multi-GPU systems (low)
 
-プライマリモニターのパイプラインは、エンコード+送信スレッドが 2 つの `RtspPublisher` に同じ `EncodedPacket` を送出する。2 本の RTSP 接続の状態は独立して管理する。
+- **Issue**: On laptops with an iGPU and a dGPU, monitors may be attached to different adapters.
+- **Mitigation**: The adapter / output pair is found by matching the `HMONITOR` (see 2.2), and `DuplicateOutput` is called on that adapter's device.
 
----
+### R2: Reliability of Windows display numbers (mitigated, low)
 
-## 5. 設定ファイル構造
+- **Issue**: The `n` in `\\.\DISPLAYn` can change when a monitor is powered off, disconnected or after a reboot (Windows repacks the numbers).
+- **Mitigation**: Pipelines are keyed by the CCD `monitorDevicePath`; the number and the primary flag are recomputed every poll and a change retargets the pipeline.
+- **Residual risk**: When the CCD API fails, `device_name` is the fallback key, so a configuration where device names get repacked may occasionally see a wrong number assignment.
+  Such failures are limited to legacy GPUs or unusual driver environments.
 
-```json
-{
-  "app": {
-    "instance_name": "screen-relay",
-    "log_dir": "./logs",
-    "log_level": "info",
-    "metrics_path": "./state/metrics.json",
-    "health_path": "./state/health.json"
-  },
-  "capture": {
-    "backend": "dxgi",
-    "frame_timeout_ms": 100
-  },
-  "encoder": {
-    "codec": "h264_nvenc",
-    "fallback_codecs": ["h264_mf", "libx264"],
-    "bitrate_kbps": 4000,
-    "fps": 60,
-    "gop_size": 60,
-    "max_b_frames": 0,
-    "preset": "fast",
-    "tune": "zerolatency"
-  },
-  "rtsp": {
-    "base_url": "rtsp://192.168.0.100:8554",
-    "path_pattern": "/live/screen{n}",
-    "connect_timeout_ms": 5000,
-    "send_timeout_ms": 5000,
-    "reconnect_delay_ms": 1000,
-    "reconnect_max_delay_ms": 30000,
-    "reconnect_backoff_multiplier": 2.0
-  },
-  "runtime": {
-    "monitor_check_interval_ms": 1000,
-    "shutdown_grace_ms": 3000,
-    "emit_metrics_interval_ms": 1000
-  }
-}
-```
+### R3: NVENC session limit (known, handled)
 
----
+- **Issue**: Consumer GPUs allow only 2-3 concurrent NVENC sessions.
+- **Mitigation**: `h264_nvenc` is tried per monitor and the next codec in the chain is used on failure, so mixed encoders across monitors are accepted.
 
-## 6. ディレクトリ構成
+### R4: DRM-protected content (accepted)
 
-```
-screen-relay/
-├── src/
-│   ├── main.cpp
-│   ├── app/
-│   │   ├── supervisor.hpp/cpp          # MonitorSupervisor
-│   │   └── state_machine.hpp/cpp
-│   ├── capture/
-│   │   ├── capture_backend.hpp         # ICaptureBackend インターフェース
-│   │   ├── dxgi_capture.hpp/cpp        # DXGI 実装
-│   │   ├── wgc_capture.hpp/cpp         # WGC 実装
-│   │   └── frame_pump.hpp/cpp          # キャプチャスレッド + キュー
-│   ├── common/
-│   │   ├── types.hpp
-│   │   ├── errors.hpp
-│   │   └── time_utils.hpp
-│   ├── config/
-│   │   └── config_loader.hpp/cpp
-│   ├── encoder/
-│   │   └── encoder_controller.hpp/cpp
-│   ├── logging/
-│   │   └── log_sink.hpp/cpp
-│   ├── metrics/
-│   │   └── metrics_store.hpp/cpp
-│   ├── monitor/
-│   │   └── monitor_detector.hpp/cpp    # EnumDisplayMonitors + 番号マッピング
-│   └── rtsp/
-│       └── rtsp_publisher_client.hpp/cpp
-├── tests/
-│   └── unit/
-├── config/
-│   └── config.example.json
-├── docs/
-│   └── design.md
-├── CMakeLists.txt
-└── toolchain-mingw.cmake
-```
+- **Issue**: Desktop Duplication returns black for DRM-protected content (a Windows security feature).
+- **Mitigation**: Accepted as a limitation.
 
----
+### R5: WGC backend (not implemented)
 
-## 7. 依存ライブラリ
-
-| ライブラリ | バージョン | ライセンス | 形態 |
-|---|---|---|---|
-| FFmpeg | avcodec ≥ 62 | LGPL-2.1+ | 動的 DLL |
-| spdlog | v1.15.1 | MIT | FetchContent (ヘッダー) |
-| nlohmann/json | v3.12.0 | MIT | FetchContent (ヘッダー) |
-| Windows SDK | (MSYS2 同梱) | - | システム |
-
-FFmpeg は LGPL 動的リンクにより、アプリ本体を MIT ライセンスで配布可能。
-
----
-
-## 8. 技術的リスクと対策
-
-### R1: MinGW + C++/WinRT 互換性 (中リスク)
-
-- **内容**: WGC バックエンドは C++/WinRT ヘッダーを使用する。MinGW での動作は未確認
-- **対策**: ビルド初期段階で WGC の簡易プロトタイプを構築して検証。失敗した場合は WRL (Windows Runtime C++ Template Library) の COM ベース API に切替えるか、WGC バックエンドを MSVC 専用オプションとして分岐
-- **影響範囲**: wgc_capture.hpp/cpp のみ
-
-### R2: DXGI マルチ GPU 環境 (低リスク)
-
-- **内容**: ノート PC 等の iGPU + dGPU 環境で、各モニターが異なるアダプターに接続される場合がある
-- **対策**: `EnumDisplayDevices` でモニターのアダプター名を特定し、対応する `IDXGIAdapter` を使って `DuplicateOutput` を呼出す
-
-### R3: Windows ディスプレイ番号の信頼性 (対応済み・低リスク)
-
-- **内容**: `\\.\DISPLAYn` の n がモニター電源断・切断・再起動で変化する場合がある（Windows が番号を再パックする）
-- **対応**: パイプラインのキーを CCD API の `monitorDevicePath`（物理モニター単位で安定な ID）に変更した。番号は毎ポーリング再計算して Windows 設定に追従する。プライマリ変化も毎ポーリングで検知して再ターゲットする
-- **残存リスク**: CCD API が失敗した環境では `device_name` をフォールバックとして使用するため、デバイス名の再パックが発生する構成では稀に番号ずれが生じる可能性がある（同 API 失敗はレガシー GPU や特殊なドライバー環境に限られる）
-
-### R4: NVENC セッション上限 (既知・設計済み)
-
-- **内容**: コンシューマー GPU は同時 NVENC セッション数 2〜3 が上限
-- **対策**: モニター単位で `h264_nvenc` 初期化を試みて失敗したら次のコーデックにフォールバック。混在運用を許容する設計
-
-### R5: DRM 保護コンテンツ (受容済み)
-
-- **内容**: DXGI / WGC ともに DRM 保護コンテンツは黒画面になる (Windows のセキュリティ仕様)
-- **対策**: 仕様として受け入れる。ドキュメントに明記する
-
----
-
-## 9. 実装フェーズ案
-
-| フェーズ | 内容 |
-|---|---|
-| 1 | ビルド環境構築、CMakeLists.txt、FFmpeg リンク確認 |
-| 2 | MonitorDetector + 番号マッピング |
-| 3 | DXGI キャプチャバックエンド + FramePump |
-| 4 | EncoderController (SpoutRelay から移植・調整) |
-| 5 | RtspPublisher (SpoutRelay から移植・調整) |
-| 6 | ScreenPipeline + ステートマシン統合 |
-| 7 | MonitorSupervisor (追加・削除・再構成の動的管理) |
-| 8 | ConfigLoader + Logger + MetricsStore |
-| 9 | WGC バックエンド (MinGW 互換性確認後) |
-| 10 | 結合テスト・ユニットテスト |
+An earlier plan included a Windows Graphics Capture backend selectable through `capture.backend`.
+It was never implemented; only `dxgi` is accepted.
+C++/WinRT header compatibility with MinGW remains the main unknown if it is revisited.

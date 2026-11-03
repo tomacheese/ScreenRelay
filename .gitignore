@@ -1,17 +1,17 @@
-# 実際の環境値を含むローカル設定
+# Local config containing real values
 config/config.json
 
-# ビルド成果物と CMake FetchContent キャッシュ
+# Build output and CMake FetchContent cache
 build/
 
-# ランタイム状態
+# Runtime state
 state/
 logs/
 
-# ダウンロードしたバイナリ依存（コミット対象外）
+# Downloaded binary dependencies (not committed)
 deps/ffmpeg/
 deps/mediamtx/
 deps/*.zip
 
-# テスト用一時ファイル
+# Temporary files from tests
 test_*_tmp.json

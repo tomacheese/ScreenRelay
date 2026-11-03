@@ -5,27 +5,19 @@
 #include <algorithm>
 #include <memory>
 
-/**
- * @brief モニター単位のパイプラインステート
- *
- * 各モニターのキャプチャ・配信パイプラインが取りうる状態を表す。
- */
+/** @brief Per-monitor capture/streaming pipeline state. */
 enum class PipelineState {
-    INIT,           ///< 初期化前
-    CAPTURING,      ///< キャプチャ中 (RTSP 接続前)
-    CONNECTING,     ///< RTSP 接続中
-    STREAMING,      ///< 正常配信中
-    RECONNECTING,   ///< RTSP 再接続中
-    RECONFIGURING,  ///< 解像度変更対応中
-    STOPPING,       ///< グレースフルシャットダウン中
-    FATAL           ///< 回復不能エラー
+    INIT,           ///< Not yet initialized
+    CAPTURING,      ///< Capturing, RTSP not connected yet
+    CONNECTING,     ///< RTSP connecting
+    STREAMING,      ///< Streaming normally
+    RECONNECTING,   ///< RTSP reconnecting
+    RECONFIGURING,  ///< Handling a resolution change
+    STOPPING,       ///< Graceful shutdown in progress
+    FATAL           ///< Unrecoverable error
 };
 
-/**
- * @brief PipelineState を文字列に変換する
- * @param s 変換対象のステート
- * @return ステート名の文字列 (定数)
- */
+/** @brief Name of @p s as a static string ("UNKNOWN" for out-of-range values). */
 inline const char* state_name(PipelineState s) {
     switch (s) {
         case PipelineState::INIT:          return "INIT";
@@ -40,110 +32,86 @@ inline const char* state_name(PipelineState s) {
     }
 }
 
-/**
- * @brief ピクセルフォーマット
- */
 enum class PixelFormat { BGRA, RGBA, RGB, BGR };
 
-/**
- * @brief フレームバッファ
- *
- * キャプチャしたピクセルデータを保持する構造体。
- */
+/** @brief A captured frame: CPU pixel data and/or a GPU texture reference. */
 struct FrameBuffer {
-    std::vector<uint8_t> data;  ///< ピクセルデータ
-    uint32_t width  = 0;         ///< 幅 (ピクセル)
-    uint32_t height = 0;         ///< 高さ (ピクセル)
-    PixelFormat format = PixelFormat::BGRA;  ///< ピクセルフォーマット
+    std::vector<uint8_t> data;  ///< Pixel data
+    uint32_t width  = 0;         ///< Width (pixels)
+    uint32_t height = 0;         ///< Height (pixels)
+    PixelFormat format = PixelFormat::BGRA;  ///< Pixel format
 
     /**
-     * @brief GPU ゼロコピーパス用の D3D11 テクスチャハンドル (型消去)
+     * @brief Type-erased D3D11 texture handle for the GPU zero-copy path.
      *
-     * 実体は ID3D11Texture2D* への参照カウント付きハンドルであり、
-     * カスタムデリーターが Release() を呼び出す。共通ヘッダーを D3D11 に
-     * 依存させないため shared_ptr<void> で型消去している。
+     * Holds a ref-counted ID3D11Texture2D* whose custom deleter calls Release().
+     * Type-erased via shared_ptr<void> to keep this common header free of D3D11.
      *
-     * 設定されている場合、キャプチャバックエンドは CPU 側の色空間変換・
-     * メモリコピー (Map/memcpy/sws_scale) を行わずに GPU テクスチャを
-     * そのまま引き渡しており、data は空のままでよい。エンコーダー側は
-     * このテクスチャを直接ハードウェアエンコーダーへ渡すゼロコピーパスを
-     * 使用できる。nullptr の場合は通常の CPU パス（data を使用）になる。
+     * When set, the capture backend skipped CPU-side conversion/copies and
+     * @c data may be empty; the encoder can hand the texture straight to the
+     * hardware encoder. When null, the frame carries its pixels in @c data
+     * (the encoder may still upload them to the GPU, see EncoderController::encode()).
      */
     std::shared_ptr<void> gpu_texture;
 };
 
-/**
- * @brief フレームメタデータ
- *
- * フレームのシーケンス番号・タイムスタンプ・解像度を保持する。
- */
+/** @brief Per-frame sequence number, timestamp and resolution. */
 struct FrameMeta {
-    uint64_t sequence     = 0;   ///< フレームシーケンス番号
-    int64_t  timestamp_us = 0;   ///< タイムスタンプ (マイクロ秒)
-    uint32_t width        = 0;   ///< 幅 (ピクセル)
-    uint32_t height       = 0;   ///< 高さ (ピクセル)
+    uint64_t sequence     = 0;   ///< Frame sequence number
+    int64_t  timestamp_us = 0;   ///< Timestamp (us)
+    uint32_t width        = 0;   ///< Width (pixels)
+    uint32_t height       = 0;   ///< Height (pixels)
 };
 
-/**
- * @brief エンコード済みパケット
- *
- * FFmpeg でエンコードされたパケットデータを保持する。
- */
+/** @brief An FFmpeg-encoded packet (video or audio). */
 struct EncodedPacket {
-    std::vector<uint8_t> data;   ///< エンコード済みバイト列
-    int64_t pts         = 0;     ///< プレゼンテーションタイムスタンプ
-    int64_t dts         = 0;     ///< デコードタイムスタンプ
-    int64_t duration    = 0;     ///< パケットの継続時間
-    bool is_key_frame   = false; ///< キーフレームフラグ
-    int  time_base_num  = 1;     ///< タイムベース分子
-    int  time_base_den  = 60;    ///< タイムベース分母
+    std::vector<uint8_t> data;   ///< Encoded bytes
+    int64_t pts         = 0;     ///< Presentation timestamp (in time_base units)
+    int64_t dts         = 0;     ///< Decode timestamp (in time_base units)
+    int64_t duration    = 0;     ///< Packet duration (in time_base units)
+    bool is_key_frame   = false; ///< Key frame flag
+    int  time_base_num  = 1;     ///< Time base numerator
+    int  time_base_den  = 60;    ///< Time base denominator
 
     /**
-     * @brief 音声パケットの絶対キャプチャ時刻 (μs, UNIX エポック起点)
+     * @brief Absolute capture time of an audio packet (us, UNIX epoch).
      *
-     * 音声パイプラインは全モニターの RTSP ストリームで共有されるため、
-     * パケット自体の pts は単一の基準（エンコード開始時刻）に基づく。
-     * 各 ScreenPipeline は自身の RTSP 接続開始時刻を基準にこの値から
-     * pts を再計算し、RTCP SR の NTP-RTP 対応を維持する。
-     * 映像パケットでは未使用（0 のまま）。
+     * The audio pipeline is shared by all monitors' RTSP streams, so the packet's
+     * own pts is relative to a single base (encode start). Each ScreenPipeline
+     * recomputes pts from this value relative to its own RTSP connection start,
+     * which keeps the RTCP SR NTP-RTP mapping consistent. Unused (0) for video.
      */
     int64_t capture_timestamp_us = 0;
 };
 
-/**
- * @brief エンコーダー設定
- *
- * 使用するコーデックや映像品質に関するパラメータを保持する。
- */
+/** @brief Video encoder settings. */
 struct EncoderConfig {
-    std::string codec                        = "h264_nvenc";       ///< 優先コーデック
-    std::vector<std::string> fallback_codecs = {"h264_mf", "libx264"};  ///< フォールバックコーデックリスト
-    int bitrate_kbps  = 4000;      ///< ターゲットビットレート (kbps)
-    int fps           = 60;        ///< フレームレート
-    int gop_size      = 60;        ///< GOP サイズ
-    int max_b_frames  = 0;         ///< 最大 B フレーム数
-    std::string preset = "fast";   ///< エンコードプリセット
-    std::string tune   = "zerolatency";  ///< チューニングオプション
-    int threads        = 0;        ///< エンコードスレッド数 (0=自動)
+    std::string codec                        = "h264_nvenc";       ///< Preferred codec
+    std::vector<std::string> fallback_codecs = {"h264_mf", "libx264"};  ///< Fallback codecs, in order
+    int bitrate_kbps  = 4000;      ///< Target bitrate (kbps)
+    int fps           = 60;        ///< Frame rate
+    int gop_size      = 60;        ///< GOP size
+    int max_b_frames  = 0;         ///< Max B-frames
+    std::string preset = "fast";   ///< Encoder preset
+    std::string tune   = "zerolatency";  ///< Tuning option
+    int threads        = 0;        ///< Encoder threads (0 = auto)
 };
 
-/**
- * @brief 音声キャプチャの取得元種別
- */
+/** @brief Audio capture source kind. */
 enum class AudioSourceKind {
-    Loopback,  ///< レンダリングデバイスのループバック（システム再生音）
-    Capture    ///< 録音デバイス（マイク等の入力）
+    Loopback,  ///< Loopback of a render device (system playback audio)
+    Capture    ///< Recording device (e.g. microphone)
 };
 
 /**
- * @brief AudioConfig::source 文字列を AudioSourceKind へ変換する
+ * @brief Convert an AudioConfig::source string to AudioSourceKind.
  *
- * 設定ファイルのバリデーション（config_loader）と実際のデバイス選択
- * （audio_capture）の両方から呼び出し、判定基準を一本化する。
+ * Shared by config validation (config_loader) and device selection
+ * (audio_capture) so both apply the same rule.
  *
- * @param source "loopback" または "capture"
- * @param[out] out 変換結果（変換に失敗した場合は変更しない）
- * @return "loopback"/"capture" のいずれかであれば true、それ以外は false
+ * @param source "loopback" or "capture"
+ * @param[out] out Result; left unchanged on failure
+ * @return true if @p source is "loopback" or "capture"
  */
 inline bool parse_audio_source_kind(const std::string& source, AudioSourceKind& out) {
     if (source == "loopback") { out = AudioSourceKind::Loopback; return true; }
@@ -151,99 +119,71 @@ inline bool parse_audio_source_kind(const std::string& source, AudioSourceKind& 
     return false;
 }
 
-/**
- * @brief 音声設定
- *
- * 映像ストリームに音声を乗せるかどうか、およびキャプチャ元デバイスを制御する。
- */
+/** @brief Audio settings: whether to add audio to the streams and where to capture it from. */
 struct AudioConfig {
-    bool enabled            = false;       ///< 音声配信を有効にするか
-    std::string source      = "loopback";  ///< "loopback"（システム再生音）または "capture"（録音デバイス）
-    std::string device_id   = "";          ///< WASAPI エンドポイント ID。空の場合は既定デバイスを使用する
-    int bitrate_kbps        = 128;         ///< AAC エンコードビットレート (kbps)
-    int sample_rate         = 48000;       ///< エンコード後のサンプルレート (Hz)
-    int channels            = 2;           ///< エンコード後のチャンネル数
+    bool enabled            = false;       ///< Enable audio streaming
+    std::string source      = "loopback";  ///< "loopback" (system playback) or "capture" (recording device)
+    std::string device_id   = "";          ///< WASAPI endpoint ID; empty = default device
+    int bitrate_kbps        = 128;         ///< AAC bitrate (kbps)
+    int sample_rate         = 48000;       ///< Output sample rate (Hz)
+    int channels            = 2;           ///< Output channel count
 };
 
-/**
- * @brief 音声キャプチャしたバッファ
- *
- * インターリーブド PCM（IEEE float 32-bit）を保持する。
- */
+/** @brief Captured audio: interleaved PCM, IEEE float 32-bit. */
 struct AudioBuffer {
-    std::vector<uint8_t> data;    ///< インターリーブド PCM データ
-    uint32_t frame_count = 0;     ///< サンプルフレーム数（全チャンネル共通）
+    std::vector<uint8_t> data;    ///< Interleaved PCM data
+    uint32_t frame_count = 0;     ///< Sample frames (one sample per channel each)
 };
 
-/**
- * @brief 音声フレームメタデータ
- */
 struct AudioMeta {
-    int64_t timestamp_us = 0;  ///< キャプチャ時刻 (μs, UNIX エポック起点)
+    int64_t timestamp_us = 0;  ///< Capture time (us, UNIX epoch)
 };
 
-/**
- * @brief 音声デバイス情報
- */
 struct AudioDeviceInfo {
-    std::string id;          ///< WASAPI エンドポイント ID
-    std::string name;        ///< フレンドリ名
-    bool        is_render = false;  ///< レンダリング（再生）デバイスなら true、録音デバイスなら false
+    std::string id;          ///< WASAPI endpoint ID
+    std::string name;        ///< Friendly name
+    bool        is_render = false;  ///< true for a render (playback) device, false for a capture device
 };
 
-/**
- * @brief 音声エンコーダーのコーデック情報
- *
- * RtspPublisherClient::connect() に渡して音声ストリームを構築するために使用する。
- */
+/** @brief Audio encoder codec info, passed to RtspPublisherClient::connect() to build the audio stream. */
 struct AudioCodecInfo {
-    int codec_id      = 0;      ///< AVCodecID の値
-    int sample_rate   = 48000;  ///< サンプルレート (Hz)
-    int channels      = 2;      ///< チャンネル数
-    int bit_rate      = 0;      ///< ビットレート (bps)
-    int time_base_num = 1;      ///< タイムベース分子
-    int time_base_den = 48000;  ///< タイムベース分母（通常サンプルレートと同じ）
-    std::vector<uint8_t> extradata;  ///< AudioSpecificConfig 等のエクストラデータ
+    int codec_id      = 0;      ///< AVCodecID value
+    int sample_rate   = 48000;  ///< Sample rate (Hz)
+    int channels      = 2;      ///< Channel count
+    int bit_rate      = 0;      ///< Bitrate (bps)
+    int time_base_num = 1;      ///< Time base numerator
+    int time_base_den = 48000;  ///< Time base denominator (normally the sample rate)
+    std::vector<uint8_t> extradata;  ///< Extra data such as AudioSpecificConfig
 };
 
-/**
- * @brief RTSP 配信設定
- *
- * RTSP サーバーへの接続・再接続に関するパラメータを保持する。
- */
+/** @brief RTSP server connection and reconnect settings. */
 struct RtspConfig {
-    std::string base_url;                           ///< RTSP サーバーのベース URL (rtsp://host:port)
-    std::string path_pattern = "/live/screen{n}";   ///< ストリームパスパターン ({n} がモニター番号に置換)
-    int connect_timeout_ms          = 5000;          ///< 接続タイムアウト (ms)
-    int send_timeout_ms             = 5000;          ///< 送信タイムアウト (ms)
-    int reconnect_delay_ms          = 1000;          ///< 再接続初期待機時間 (ms)
-    int reconnect_max_delay_ms      = 30000;         ///< 再接続最大待機時間 (ms)
-    float reconnect_backoff_multiplier = 2.0f;       ///< バックオフ乗数
+    std::string base_url;                           ///< Base URL of the RTSP server (rtsp://host:port)
+    std::string path_pattern = "/live/screen{n}";   ///< Stream path pattern ({n} is replaced by the monitor number)
+    int connect_timeout_ms          = 5000;          ///< Connect timeout (ms)
+    int send_timeout_ms             = 5000;          ///< Send timeout (ms)
+    int reconnect_delay_ms          = 1000;          ///< Initial reconnect delay (ms)
+    int reconnect_max_delay_ms      = 30000;         ///< Maximum reconnect delay (ms)
+    float reconnect_backoff_multiplier = 2.0f;       ///< Backoff multiplier
 };
 
-/**
- * @brief 指数バックオフ状態
- *
- * 再接続時の待機時間を指数的に増加させるための状態管理構造体。
- */
+/** @brief Exponential backoff state for reconnect delays. */
 struct BackoffState {
-    int attempt  = 0;     ///< 試行回数
-    int delay_ms = 1000;  ///< 現在の待機時間 (ms)
+    int attempt  = 0;     ///< Attempt count
+    int delay_ms = 1000;  ///< Current delay (ms)
 
-    /**
-     * @brief バックオフをリセットする
-     * @param initial_ms 初期待機時間 (ms)
-     */
+    /** @brief Reset to zero attempts with @p initial_ms as the next delay. */
     void reset(int initial_ms = 1000) {
         attempt  = 0;
         delay_ms = initial_ms;
     }
 
     /**
-     * @brief 次の遅延時間 (ms) を返し、内部状態を進める
-     * @param max_ms     最大待機時間 (ms)
-     * @param multiplier バックオフ乗数
-     * @return 今回の待機時間 (ms)
+     * @brief Return the current delay and advance: the next delay is
+     *        min(delay * multiplier, max_ms).
+     * @param max_ms     Delay cap (ms)
+     * @param multiplier Backoff multiplier
+     * @return The delay to wait now (ms)
      */
     int next_delay(int max_ms = 30000, float multiplier = 2.0f) {
         int d    = delay_ms;

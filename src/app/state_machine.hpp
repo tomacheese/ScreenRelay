@@ -6,63 +6,39 @@
 #include <utility>
 
 /**
- * @brief モニターパイプライン用ステートマシン
+ * @brief State machine for a monitor pipeline: rejects transitions not in the table.
  *
- * PipelineState の有効な遷移テーブルを管理し、不正な遷移を防ぐ。
- * 遷移時にコールバックを呼び出す仕組みを持つ。
+ * Only the owning pipeline thread calls transition_to(); it is a non-atomic
+ * check-then-store and is not safe for concurrent callers. current_state() may
+ * be read from any thread.
  */
 class StateMachine {
 public:
-    /**
-     * @brief ステート遷移コールバック型
-     *
-     * 遷移前のステートと遷移後のステートを引数として受け取る。
-     */
+    /** Called after a successful transition with (from, to). */
     using TransitionCallback = std::function<void(PipelineState /*from*/,
                                                    PipelineState /*to*/)>;
 
-    /** @brief コンストラクタ。初期ステートを INIT に設定し遷移テーブルを構築する。 */
     StateMachine();
 
-    /**
-     * @brief 現在のステートを返す
-     * @return 現在の PipelineState
-     */
     PipelineState current_state() const { return current_.load(); }
 
-    /**
-     * @brief 指定ステートへの遷移が有効か判定する
-     * @param to 遷移先ステート
-     * @return 有効な遷移であれば true
-     */
+    /** @brief True if the current state may move to @p to. */
     bool can_transition(PipelineState to) const;
 
     /**
-     * @brief 指定ステートへ遷移する
-     *
-     * 有効な遷移でない場合は何もせず false を返す。
-     * 成功した場合はコールバックが呼び出される。
-     * @param to 遷移先ステート
-     * @return 遷移成功時 true、無効な遷移の場合 false
+     * @brief Move to @p to, invoking the callback on success.
+     * @return false (no change, no callback) if the transition is not allowed
      */
     bool transition_to(PipelineState to);
 
-    /**
-     * @brief ステート遷移時のコールバックを登録する
-     * @param cb 遷移コールバック
-     */
+    /** @brief Register the transition callback (replaces any previous one); set before start. */
     void on_transition(TransitionCallback cb) { callback_ = std::move(cb); }
 
 private:
-    std::atomic<PipelineState> current_;          ///< 現在のステート
-    TransitionCallback callback_;    ///< 遷移時コールバック
+    std::atomic<PipelineState> current_;
+    TransitionCallback callback_;
 
-    /**
-     * @brief ペアのハッシュ関数オブジェクト
-     *
-     * unordered_set のキーとして std::pair<PipelineState, PipelineState> を
-     * 使用するためのカスタムハッシュ。
-     */
+    /** Hash for the (from, to) pair used as the unordered_set key. */
     struct PairHash {
         size_t operator()(const std::pair<PipelineState, PipelineState>& p) const {
             auto h1 = std::hash<int>{}(static_cast<int>(p.first));
@@ -71,9 +47,8 @@ private:
         }
     };
 
-    /** 有効な遷移ペアのセット */
+    /** Allowed (from, to) pairs. */
     std::unordered_set<std::pair<PipelineState, PipelineState>, PairHash> valid_transitions_;
 
-    /** @brief 有効な遷移テーブルを構築する */
     void build_transition_table();
 };

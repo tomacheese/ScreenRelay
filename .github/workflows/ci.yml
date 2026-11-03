@@ -54,7 +54,7 @@ jobs:
           default_bump: "minor"
           custom_release_rules: "feat:minor:✨ Features,fix:patch:🐛 Fixes,docs:patch:📰 Docs,chore:patch:🎨 Chore,pref:patch:🎈 Performance improvements,refactor:patch:🧹 Refactoring,build:patch:🔍 Build,ci:patch:🔍 CI,revert:patch:⏪ Revert,style:patch:🧹 Style,test:patch:👀 Test,release:major:📦 Release"
           dry_run: ${{ github.event.pull_request.merged == true && 'false' || 'true' }}
-          # pull_request_target の GITHUB_SHA は merge 後の HEAD を指さない場合があるため明示的に指定
+          # GITHUB_SHA on pull_request_target may not point at the post-merge HEAD, so pass the commit explicitly
           commit_sha: ${{ steps.checkout.outputs.commit }}
 
   post-approval-request:
@@ -73,16 +73,16 @@ jobs:
         run: |
           gh pr comment ${{ github.event.pull_request.number }} \
             --repo '${{ github.repository }}' \
-            --body '⚠️ **このフォーク PR はビルド承認が必要です**
+            --body '⚠️ **This fork PR needs build approval**
 
-          リポジトリのメンテナーが **`fork-pr-build`** Environment を承認するまで、ビルドは開始されません。
+          The build will not start until a repository maintainer approves the **`fork-pr-build`** environment.
 
-          Actions タブで当該ワークフローを開き、承認を行ってください。'
+          Open the workflow run in the Actions tab and approve it.'
 
   approval-gate:
     name: 🔐 Fork PR approval gate
     runs-on: ubuntu-latest
-    # フォーク PR (非 closed) のみ fork-pr-build environment を要求し、それ以外は空文字で即通過
+    # Only non-closed fork PRs require the fork-pr-build environment; all other events pass immediately (empty environment)
     environment: ${{ (github.event_name == 'pull_request_target' && github.event.pull_request.head.repo.full_name != github.repository && github.event.action != 'closed') && 'fork-pr-build' || '' }}
     steps:
       - name: Approved

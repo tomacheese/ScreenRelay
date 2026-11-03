@@ -17,7 +17,6 @@ MetricsStore::MetricsStore()
     : session_start_ms_(time_utils::system_now_ms()) {}
 
 MetricsStore::MonitorStats& MetricsStore::get_stats(int monitor_number) {
-    // マップに存在しない場合はデフォルト構築される
     return stats_[monitor_number];
 }
 
@@ -87,7 +86,6 @@ std::string MetricsStore::build_metrics_json() const {
         int64_t uptime_ms = time_utils::system_now_ms() - session_start_ms_;
         j["uptime_ms"] = uptime_ms;
 
-        // モニターごとのデータを "monitors" オブジェクトに格納する
         json monitors = json::object();
         for (const auto& [monitor_number, s] : stats_) {
             json m;
@@ -117,12 +115,10 @@ std::string MetricsStore::build_health_json() const {
     {
         std::lock_guard<std::mutex> lk(mutex_);
 
-        // モニターごとのヘルス状態を "monitors" オブジェクトに格納し、
-        // 全モニターが健全かどうかをトップレベルの "healthy" に反映する
+        // Top-level "healthy" is true only if monitors exist and all are healthy
         bool overall_healthy = !stats_.empty();
         json monitors = json::object();
         for (const auto& [monitor_number, s] : stats_) {
-            // "STREAMING" または "CONNECTING" 状態なら healthy とみなす
             bool healthy = (s.state == "STREAMING" || s.state == "CONNECTING");
             if (!healthy) overall_healthy = false;
             json m;
@@ -138,19 +134,15 @@ std::string MetricsStore::build_health_json() const {
 }
 
 /**
- * @brief ファイルをアトミックに書き込む
+ * @brief Writes a file atomically via a temp file renamed over the target.
  *
- * 一時ファイルに書き込んだ後、既存ファイルを置換する形でリネームすることで
- * 書き込み途中の読み取りを防ぐ。
- * 置換の前に既存ファイルを削除しないため、置換に失敗しても旧ファイルは維持され、
- * 読み取り側がファイル不存在を観測することもない。
- * 失敗時は一時ファイルを削除する。
+ * Readers never see a partial file. The existing file is not deleted first, so if the
+ * replace fails the old file is kept and readers never observe it missing. The temp file
+ * is removed on failure.
  *
- * 保証するのはファイル名の置換の原子性であり、
- * 電源断後の内容の永続性 (耐久性) は保証しない。
- * @param path    書き込み先パス
- * @param content 書き込む内容
- * @return 成功時 true
+ * Only the atomicity of the replacement is guaranteed; the temp file's contents are not
+ * fsynced, so durability across power loss is not guaranteed.
+ * @return true on success
  */
 static bool write_atomic(const std::string& path, const std::string& content) {
     std::string tmp = path + ".tmp";
@@ -163,7 +155,7 @@ static bool write_atomic(const std::string& path, const std::string& content) {
             std::ofstream f(tmp, std::ios::binary | std::ios::trunc);
             if (f.is_open()) {
                 f << content;
-                // 暗黙の close() では失敗を検出できないため、明示的に close() して確認する
+                // Close explicitly: an implicit close in the destructor cannot report failure
                 f.close();
                 written = !f.fail();
             }
@@ -176,8 +168,8 @@ static bool write_atomic(const std::string& path, const std::string& content) {
 
         bool replaced = false;
 #if defined(_WIN32)
-        // fs::rename は既存ファイルがあると失敗し得るため、削除を挟まずに
-        // 既存ファイルを置換できる MoveFileExW を使う
+        // fs::rename can fail when the target exists on Windows; MoveFileExW replaces it
+        // without a delete step
         replaced = MoveFileExW(fs::path(tmp).c_str(), fs::path(path).c_str(),
                                MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
 #else

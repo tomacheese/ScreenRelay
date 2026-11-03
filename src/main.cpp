@@ -8,20 +8,19 @@
 #include "audio/audio_capture.hpp"
 #include "config/config_loader.hpp"
 
-/** @brief グローバル停止フラグ。コンソールハンドラーから設定される */
+/** Set by the console handler to record that a stop was requested. */
 static std::atomic<bool> g_stop_requested{false};
 
-/** @brief グローバルスーパーバイザーポインタ。コンソールハンドラーから参照する */
+/** Lets the console handler (runs on a separate OS thread) reach the supervisor. */
 static std::atomic<MonitorSupervisor*> g_supervisor{nullptr};
 
 /**
- * @brief Windows コンソールイベントハンドラー
+ * @brief Console control handler (Ctrl+C, Ctrl+Break, console close).
  *
- * Ctrl+C、Ctrl+Break、ウィンドウクローズのいずれかが発生した場合に
- * スーパーバイザーへ停止リクエストを送る。
+ * Requests a graceful stop on the supervisor.
  *
- * @param ctrl_type コントロールイベントの種別
- * @return 処理した場合 TRUE、それ以外の場合 FALSE
+ * @param ctrl_type Control event type
+ * @return TRUE if handled, FALSE to fall through to the next handler
  */
 static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
     if (ctrl_type == CTRL_C_EVENT ||
@@ -36,14 +35,9 @@ static BOOL WINAPI console_ctrl_handler(DWORD ctrl_type) {
 }
 
 /**
- * @brief アプリケーションエントリポイント
+ * @brief Entry point: parse arguments, load the config and run MonitorSupervisor.
  *
- * 引数を解析して設定ファイルをロードし、MonitorSupervisor を起動する。
- * コンソールイベントハンドラーを登録してグレースフルシャットダウンをサポートする。
- *
- * @param argc コマンドライン引数の数
- * @param argv コマンドライン引数の配列
- * @return 成功時 0、エラー時 1
+ * @return 0 on success, 1 on error
  */
 int main(int argc, char* argv[]) {
     std::string config_path;
@@ -71,7 +65,6 @@ int main(int argc, char* argv[]) {
         }
     }
 
-    // デフォルト設定ファイルパス
     if (config_path.empty()) config_path = "config/config.json";
 
     AppConfig config;

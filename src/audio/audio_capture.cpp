@@ -3,9 +3,8 @@
 #include <windows.h>
 #include <mmdeviceapi.h>
 #include <audioclient.h>
-// PKEY_Device_FriendlyName の実体を確保するため INITGUID を定義してから
-// functiondiscoverykeys_devpkey.h をインクルードする (MinGW では propsys.lib が
-// このシンボルの実体を提供しないため)。
+// Define INITGUID around functiondiscoverykeys_devpkey.h so PKEY_Device_FriendlyName
+// is defined in this TU (MinGW's propsys.lib does not provide the symbol).
 #define INITGUID
 #include <functiondiscoverykeys_devpkey.h>
 #undef INITGUID
@@ -16,17 +15,11 @@
 #include <chrono>
 #include <cstring>
 
-/**
- * @brief COM インターフェースポインタを解放するヘルパー
- */
 template <typename T>
 static void safe_release(T*& p) {
     if (p) { p->Release(); p = nullptr; }
 }
 
-/**
- * @brief wstring を UTF-8 std::string に変換する
- */
 static std::string wide_to_utf8(const std::wstring& w) {
     if (w.empty()) return {};
     int len = WideCharToMultiByte(CP_UTF8, 0, w.data(), static_cast<int>(w.size()),
@@ -38,9 +31,6 @@ static std::string wide_to_utf8(const std::wstring& w) {
     return out;
 }
 
-/**
- * @brief IMMDevice のフレンドリ名を取得する
- */
 static std::string get_friendly_name(IMMDevice* device) {
     IPropertyStore* store = nullptr;
     if (FAILED(device->OpenPropertyStore(STGM_READ, &store)) || !store) return {};
@@ -56,21 +46,16 @@ static std::string get_friendly_name(IMMDevice* device) {
     return name;
 }
 
-/**
- * @brief WasapiAudioCapture の内部実装
- *
- * COM インターフェースと WAVEFORMATEX を保持する。
- */
+/** @brief COM interfaces and the mix format, kept out of the header. */
 struct WasapiAudioCapture::Impl {
-    IMMDeviceEnumerator* enumerator      = nullptr;  ///< デバイス列挙用
-    IMMDevice*           device          = nullptr;  ///< 対象デバイス
-    IAudioClient*         audio_client   = nullptr;  ///< オーディオクライアント
-    IAudioCaptureClient*  capture_client = nullptr;  ///< キャプチャクライアント
-    WAVEFORMATEX*         mix_format     = nullptr;  ///< デバイスのミックスフォーマット
-    HANDLE                event_handle   = nullptr;  ///< バッファ到着通知イベント
-    bool                  com_initialized_here = false;  ///< このスレッドで CoInitializeEx を呼んだか
+    IMMDeviceEnumerator* enumerator      = nullptr;  ///< Device enumeration
+    IMMDevice*           device          = nullptr;  ///< Target device
+    IAudioClient*         audio_client   = nullptr;  ///< Audio client
+    IAudioCaptureClient*  capture_client = nullptr;  ///< Capture client
+    WAVEFORMATEX*         mix_format     = nullptr;  ///< Device mix format
+    HANDLE                event_handle   = nullptr;  ///< Signaled when a buffer is ready
+    bool                  com_initialized_here = false;  ///< Whether init() initialized COM and must CoUninitialize
 
-    /** @brief すべての COM リソースを解放する */
     void release_all() {
         if (audio_client) audio_client->Stop();
         if (mix_format)  { CoTaskMemFree(mix_format); mix_format = nullptr; }
@@ -102,7 +87,7 @@ std::vector<AudioDeviceInfo> WasapiAudioCapture::enumerate_devices(std::string& 
         return result;
     }
 
-    // eRender（ループバック用）と eCapture（録音デバイス）の両方を列挙する
+    // eRender (for loopback) and eCapture (microphones)
     const EDataFlow flows[2] = { eRender, eCapture };
     for (EDataFlow flow : flows) {
         IMMDeviceCollection* collection = nullptr;
@@ -138,8 +123,8 @@ bool WasapiAudioCapture::init(const AudioConfig& config, std::string& error) {
     release();
 
     HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    // RPC_E_CHANGED_MODE はこのスレッドで既に別モードの COM が初期化済みという
-    // ことであり、致命的ではないため続行する。
+    // RPC_E_CHANGED_MODE means COM is already initialized on this thread in another
+    // apartment mode; that is not fatal, so continue (and do not CoUninitialize).
     impl_->com_initialized_here = SUCCEEDED(hr);
 
     hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
@@ -192,8 +177,8 @@ bool WasapiAudioCapture::init(const AudioConfig& config, std::string& error) {
     DWORD stream_flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
     if (is_loopback) stream_flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
 
-    // バッファ長は 200ms 相当。イベント駆動のため実際の遅延はイベント間隔に依存する。
-    constexpr REFERENCE_TIME kBufferDuration = 200 * 10000;  // 100ns 単位
+    // 200 ms buffer. Actual latency depends on the event interval (event-driven mode).
+    constexpr REFERENCE_TIME kBufferDuration = 200 * 10000;  // 100 ns units
     hr = impl_->audio_client->Initialize(AUDCLNT_SHAREMODE_SHARED, stream_flags,
                                         kBufferDuration, 0, impl_->mix_format, nullptr);
     if (FAILED(hr)) {
@@ -248,14 +233,13 @@ void WasapiAudioCapture::capture_thread_func() {
         if (!running_.load()) break;
 
         if (wait_result != WAIT_OBJECT_0) {
-            // 2 秒間バッファが届かない場合はデバイス切断等の可能性がある。
-            // ハードエラーとして通知し、呼び出し元の再初期化に委ねる。
+            // A long wait without a buffer suggests the device was disconnected: report a hard error.
             {
                 std::lock_guard<std::mutex> lk(last_error_mutex_);
                 last_error_ = "Audio capture event wait timed out";
             }
-            // ハードエラー確定後もループを回し続けると同じ失敗を延々と繰り返すため、
-            // ここでスレッド自体を終了させ、呼び出し側の再初期化に委ねる。
+            // Stop the thread rather than loop on the same failure; consumers see it
+            // via has_hard_error().
             hard_error_.store(true);
             running_.store(false);
             break;
@@ -285,8 +269,8 @@ void WasapiAudioCapture::capture_thread_func() {
                 static_cast<size_t>(num_frames) * impl_->mix_format->nBlockAlign;
 
             if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                // 無音期間はゼロ埋めのバッファを生成する（ループバック時、無音でも
-                // フレームは配信し続けないと受信側の音声タイムラインが途切れる）。
+                // Emit zero-filled frames for SILENT packets; dropping them would break
+                // the receiver's audio timeline.
                 buf.data.assign(byte_count, 0);
             } else if (data && byte_count > 0) {
                 buf.data.assign(data, data + byte_count);
@@ -333,7 +317,7 @@ bool WasapiAudioCapture::wait_pop(AudioBuffer& buf, AudioMeta& meta, int timeout
 
 void WasapiAudioCapture::release() {
     running_.store(false);
-    // capture_thread_func のイベント待ちを解除して即座に終了させる
+    // Wake capture_thread_func out of its event wait so it exits immediately
     if (impl_->event_handle) SetEvent(impl_->event_handle);
     if (thread_.joinable()) thread_.join();
 

@@ -1,16 +1,25 @@
-# 設定リファレンス
+# Configuration Reference
 
-## 設定ファイルの場所
+## Config file location
 
-デフォルトは `config/config.json` です。コマンドライン引数で変更できます。
+The default is `config/config.json`. Override it on the command line with `--config <path>` (short form `-c`).
 
 ```bash
 screen-relay.exe --config path/to/config.json
 ```
 
+`config/config.example.json` is a ready-to-copy template. Any key you omit keeps the default listed below, except `rtsp.base_url`, which is required. A malformed file or a validation failure prints `[ERROR] <reason>` and exits with code 1.
+
+Other command-line options:
+
+| Option | Description |
+|---|---|
+| `--list-audio-devices` | Print the available audio endpoints (`[loopback]` render devices and `[capture]` recording devices) with their IDs, then exit |
+| `--help`, `-h` | Print usage and exit |
+
 ---
 
-## 完全なサンプル設定
+## Full sample configuration
 
 ```json
 {
@@ -61,95 +70,97 @@ screen-relay.exe --config path/to/config.json
 }
 ```
 
----
-
-## `app` セクション
-
-アプリケーション全体の基本設定です。
-
-| フィールド | 型 | デフォルト | 説明 |
-|---|---|---|---|
-| `instance_name` | string | `"screen-relay"` | インスタンスの識別名。ログや metrics に記録される |
-| `log_dir` | string | `"./logs"` | ログファイルの出力ディレクトリ |
-| `log_level` | string | `"info"` | ログレベル。`trace` / `debug` / `info` / `warn` / `error` / `critical` |
-| `metrics_path` | string | `"./state/metrics.json"` | metrics.json の出力パス |
-| `health_path` | string | `"./state/health.json"` | health.json の出力パス |
-
-### バリデーション
-
-- `log_level` は `trace` / `debug` / `info` / `warn` / `error` / `critical` のいずれかでなければなりません
+`encoder.threads` is accepted but is not included in `config/config.example.json`.
 
 ---
 
-## `capture` セクション
+## `app` section
 
-スクリーンキャプチャバックエンドの設定です。
+General application settings.
 
-| フィールド | 型 | デフォルト | 説明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `backend` | string | `"dxgi"` | キャプチャバックエンド。現在は `"dxgi"` のみ対応 |
-| `frame_timeout_ms` | integer | `100` | `AcquireNextFrame()` のタイムアウト（ミリ秒）。0 は即時返却 |
+| `instance_name` | string | `"screen-relay"` | Instance name. Used as the log file name (`<instance_name>.jsonl`) and as the logger name |
+| `log_dir` | string | `"./logs"` | Directory for log files (created if missing) |
+| `log_level` | string | `"info"` | Log level: `trace` / `debug` / `info` / `warn` / `error` / `critical` |
+| `metrics_path` | string | `"./state/metrics.json"` | Output path of `metrics.json` (parent directory is created if missing) |
+| `health_path` | string | `"./state/health.json"` | Output path of `health.json` (parent directory is created if missing) |
 
-### バリデーション
+### Validation
 
-- `backend` は `"dxgi"` でなければなりません（将来的に `"wgc"` 等を追加予定）
-- `frame_timeout_ms` は 0 以上でなければなりません
+- None. The loader does not validate this section. An unrecognized `log_level` silently falls back to `info`.
 
 ---
 
-## `encoder` セクション
+## `capture` section
 
-H.264 エンコーダーの設定です。
+Screen capture backend settings.
 
-| フィールド | 型 | デフォルト | 説明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `codec` | string | `"h264_nvenc"` | 優先コーデック名（FFmpeg のコーデック名） |
-| `fallback_codecs` | string[] | `["h264_mf", "libx264"]` | フォールバックコーデックのリスト（順に試行） |
-| `bitrate_kbps` | integer | `4000` | エンコードビットレート（kbps） |
-| `fps` | integer | `60` | フレームレート（fps） |
-| `gop_size` | integer | `60` | GOP サイズ（フレーム数）。キーフレーム間隔 |
-| `max_b_frames` | integer | `0` | 最大 B フレーム数。低遅延用途では `0` を推奨 |
-| `preset` | string | `"fast"` | エンコードプリセット（コーデックに依存） |
-| `tune` | string | `"zerolatency"` | チューニングオプション（コーデックに依存） |
-| `threads` | integer | `0` | エンコードスレッド数。`0` で自動 |
+| `backend` | string | `"dxgi"` | Capture backend. Only `"dxgi"` is currently supported |
+| `frame_timeout_ms` | integer | `100` | Timeout in milliseconds for `AcquireNextFrame()`. `0` returns immediately |
 
-### `fallback_codecs` について
+### Validation
 
-`fallback_codecs` は配列で複数のコーデックを指定できます。`codec` の初期化に失敗した場合、リスト順に試行します。
+- `backend` must be `"dxgi"`
+- `frame_timeout_ms` must be 0 or greater
+
+---
+
+## `encoder` section
+
+H.264 encoder settings.
+
+| Field | Type | Default | Description |
+|---|---|---|---|
+| `codec` | string | `"h264_nvenc"` | Preferred codec (FFmpeg encoder name) |
+| `fallback_codecs` | string[] | `["h264_mf", "libx264"]` | Fallback codecs, tried in order |
+| `bitrate_kbps` | integer | `4000` | Target bitrate (kbps) |
+| `fps` | integer | `60` | Frame rate (fps) |
+| `gop_size` | integer | `60` | GOP size in frames (keyframe interval) |
+| `max_b_frames` | integer | `0` | Maximum number of B-frames. `0` is recommended for low latency |
+| `preset` | string | `"fast"` | Encoder preset (codec dependent) |
+| `tune` | string | `"zerolatency"` | Tuning option (codec dependent) |
+| `threads` | integer | `0` | Number of encoder threads. `0` means automatic |
+
+### `fallback_codecs`
+
+If initializing `codec` fails, the codecs in `fallback_codecs` are tried in list order. For the default configuration the order is `h264_nvenc` → `h264_mf` → `libx264`. If every codec fails, the monitor's pipeline enters the `FATAL` state (see [state-machine.md](state-machine.md)).
 
 ```json
 "fallback_codecs": ["h264_mf", "libx264"]
 ```
 
-上記の場合、試行順は `h264_nvenc` → `h264_mf` → `libx264` となります。すべて失敗した場合はパイプラインが `FATAL` 状態になります。
+The codec actually selected is reported in the `encoder_initialized` log event and in the `codec` field of `metrics.json`.
 
-### バリデーション
+### Validation
 
-- `bitrate_kbps` は 1 以上でなければなりません
-- `fps` は 1 以上でなければなりません
-- `gop_size` は 1 以上でなければなりません
-- `max_b_frames` は 0 以上でなければなりません
-- `threads` は 0 以上でなければなりません
+- `bitrate_kbps` must be greater than 0
+- `fps` must be between 1 and 240
+- `gop_size`, `max_b_frames` and `threads` are not range-checked by the loader
 
 ---
 
-## `rtsp` セクション
+## `rtsp` section
 
-RTSP 配信の設定です。
+RTSP publishing settings.
 
-| フィールド | 型 | デフォルト | 説明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `base_url` | string | （必須） | RTSP サーバーのベース URL（例: `rtsp://192.168.0.100:8554`） |
-| `path_pattern` | string | `"/screen{n}"` | RTSP パスのパターン。`{n}` がモニター番号に置換される |
-| `connect_timeout_ms` | integer | `5000` | RTSP 接続タイムアウト（ミリ秒） |
-| `send_timeout_ms` | integer | `5000` | RTP パケット送信タイムアウト（ミリ秒） |
-| `reconnect_delay_ms` | integer | `1000` | 初回再接続待機時間（ミリ秒） |
-| `reconnect_max_delay_ms` | integer | `30000` | 最大再接続待機時間（ミリ秒）。指数バックオフの上限 |
-| `reconnect_backoff_multiplier` | float | `2.0` | 指数バックオフの乗数 |
+| `base_url` | string | (required) | Base URL of the RTSP server (e.g. `rtsp://192.168.0.100:8554`) |
+| `path_pattern` | string | `"/live/screen{n}"` | Stream path pattern. `{n}` is replaced with the monitor number. See the note below about the default |
+| `connect_timeout_ms` | integer | `5000` | RTSP connect timeout (ms) |
+| `send_timeout_ms` | integer | `5000` | RTP packet send timeout (ms) |
+| `reconnect_delay_ms` | integer | `1000` | Initial reconnect delay (ms) |
+| `reconnect_max_delay_ms` | integer | `30000` | Maximum reconnect delay (ms). Upper bound of the exponential backoff |
+| `reconnect_backoff_multiplier` | float | `2.0` | Exponential backoff multiplier |
 
-### `path_pattern` について
+### `path_pattern`
 
-`{n}` は **現在の Windows 設定ディスプレイ番号**（デバイス名 `\\.\DISPLAYn` の `n`）に置換されます。モニター構成変化（接続・切断・プライマリ切替）が発生した場合、`monitor_check_interval_ms` 以内に新しい番号へ追従します。
+The built-in default (`types.hpp`) is `/live/screen{n}`, but `config/config.example.json` and all examples in this document use `/screen{n}`. If you want `/screen{n}`, set it explicitly; a config that omits `path_pattern` publishes to `/live/screen{n}`.
+
+`{n}` is replaced with the **display number in the current Windows settings** (the `n` of the device name `\\.\DISPLAYn`). When the monitor configuration changes (connect, disconnect, primary switch), the stream paths follow the new numbers within `monitor_check_interval_ms`.
 
 ```
 path_pattern = "/screen{n}"
@@ -158,88 +169,93 @@ DISPLAY1 → rtsp://192.168.0.100:8554/screen1
 DISPLAY2 → rtsp://192.168.0.100:8554/screen2
 ```
 
-**プライマリモニターのエイリアス**: プライマリモニターは `{n}` のパスに加えて `/screen0` にも自動的に配信されます。`/screen0` は**常に現在のプライマリモニター**の映像を指します。プライマリが別のモニターに移った場合、`monitor_check_interval_ms` 以内に `/screen0` が新プライマリへ追従します。
+**Primary monitor alias**: the primary monitor is also published automatically on `0` in place of `{n}` (e.g. `/screen0` for `/screen{n}`). That path always carries the current primary monitor. When the primary moves to another monitor, the alias follows within `monitor_check_interval_ms`.
 
 ```
-DISPLAY2 (primary) → /screen2 および /screen0 の両方に配信
-DISPLAY1           → /screen1 のみに配信
+DISPLAY2 (primary) → published to both /screen2 and /screen0
+DISPLAY1           → published to /screen1 only
 ```
 
-> **注意**: Windows 設定での番号にギャップ（例: 1, 3 のみで 2 が欠番）が生じた場合、screenN もそのギャップをそのまま反映します（独自の番号詰め直しは行いません）。これは Windows 設定アプリの表示との一貫性を保つための仕様です。
+> **Note**: if the Windows settings numbers have gaps (e.g. only 1 and 3 exist), the stream paths reflect the gaps as is; numbers are not repacked. This keeps the paths consistent with what the Windows Settings app shows.
 
-### 再接続バックオフの計算
+### Reconnect backoff
+
+With `n` counting from 0 for the first retry:
 
 ```
 delay(n) = min(reconnect_delay_ms × reconnect_backoff_multiplier^n, reconnect_max_delay_ms)
 ```
 
-デフォルト設定での待機時間の例:
+Example delays with the default settings:
 
-| 試行回数 | 待機時間 |
+| Attempt | Delay |
 |---|---|
-| 1 回目 | 1000 ms |
-| 2 回目 | 2000 ms |
-| 3 回目 | 4000 ms |
-| 4 回目 | 8000 ms |
-| 5 回目以降 | 30000 ms (上限) |
+| 1st | 1000 ms |
+| 2nd | 2000 ms |
+| 3rd | 4000 ms |
+| 4th | 8000 ms |
+| 5th and later | 30000 ms (cap) |
 
-### バリデーション
+The `reconnecting` log event records each attempt number and delay, and `reconnect_attempts` in `metrics.json` counts them.
 
-- `base_url` は `rtsp://` で始まらなければなりません
-- `connect_timeout_ms` は 1 以上でなければなりません
-- `send_timeout_ms` は 1 以上でなければなりません
-- `reconnect_delay_ms` は 1 以上でなければなりません
-- `reconnect_max_delay_ms` は `reconnect_delay_ms` 以上でなければなりません
-- `reconnect_backoff_multiplier` は 1.0 以上でなければなりません
+### Validation
+
+- `base_url` must start with `rtsp://`
+- `connect_timeout_ms` must be greater than 0
+- `send_timeout_ms` must be greater than 0
+- `reconnect_delay_ms` must be greater than 0
+- `reconnect_max_delay_ms` must be greater than 0 and at least `reconnect_delay_ms`
+- `reconnect_backoff_multiplier` must be 1.0 or greater
 
 ---
 
-## `audio` セクション
+## `audio` section
 
-音声配信の設定です。有効にすると、WASAPI で取得した音声を AAC でエンコードし、**全モニターの RTSP ストリーム**（`/screen1`, `/screen2`, ... `/screen0`）に同一の音声として配信します。
+Audio publishing settings. When enabled, audio captured through WASAPI is encoded as AAC and published as the same audio track on **every monitor's RTSP stream** (including the `/screen0` alias).
 
-| フィールド | 型 | デフォルト | 説明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `enabled` | bool | `false` | 音声配信を有効にするか |
-| `source` | string | `"loopback"` | 音声取得元。`"loopback"`（システム再生音）または `"capture"`（マイク等の録音デバイス） |
-| `device_id` | string | `""` | WASAPI エンドポイント ID。空の場合は既定デバイスを使用する。デバイス一覧は `--list-audio-devices` で確認できる |
-| `bitrate_kbps` | integer | `128` | AAC エンコードビットレート（kbps） |
-| `sample_rate` | integer | `48000` | エンコード後のサンプルレート（Hz） |
-| `channels` | integer | `2` | エンコード後のチャンネル数（`1`=モノラル、`2`=ステレオ） |
+| `enabled` | boolean | `false` | Enable audio publishing |
+| `source` | string | `"loopback"` | Audio source: `"loopback"` (system playback sound) or `"capture"` (recording device such as a microphone) |
+| `device_id` | string | `""` | WASAPI endpoint ID. Empty selects the default device for `source` |
+| `bitrate_kbps` | integer | `128` | AAC encode bitrate (kbps) |
+| `sample_rate` | integer | `48000` | Encoded sample rate (Hz) |
+| `channels` | integer | `2` | Encoded channel count (`1` = mono, `2` = stereo) |
 
-### 対象デバイスの選び方
+### Choosing a device
 
-利用可能な音声デバイス（ループバック用のレンダリングデバイス、および録音デバイス）を確認するには次のコマンドを実行します。
+To list the available audio devices (render devices for loopback, and recording devices), run:
 
 ```bash
 screen-relay.exe --list-audio-devices
 ```
 
-出力された `id` を `device_id` に設定してください。`device_id` を空にした場合は、`source` に応じた既定デバイス（既定の再生デバイス、または既定の録音デバイス）が使用されます。
+Each line is prefixed with `[loopback]` (render device, usable with `source: "loopback"`) or `[capture]` (recording device, usable with `source: "capture"`), followed by the endpoint ID and the device name. Set the ID in `device_id`. If `device_id` is empty, the default playback device (loopback) or default recording device (capture) is used according to `source`.
 
-### 音声の初期化に失敗した場合
+### Audio initialization failure
 
-音声パイプラインの初期化（デバイスの取得や AAC エンコーダーの初期化）に失敗しても、映像配信には影響しません。エラーはログに記録され、音声なしで起動を継続します。
+If the audio pipeline fails to initialize (device acquisition or AAC encoder setup), video publishing is not affected. An `AUDIO_INIT_FAILED` error is logged and the application continues without audio.
 
-### バリデーション（`enabled: true` の場合のみ）
+### Validation (only when `enabled` is `true`)
 
-- `source` は `"loopback"` または `"capture"` でなければなりません
-- `bitrate_kbps` は 1 以上でなければなりません
-- `sample_rate` は 1 以上でなければなりません
-- `channels` は `1` または `2` でなければなりません
+- `source` must be `"loopback"` or `"capture"`
+- `bitrate_kbps` must be greater than 0
+- `sample_rate` must be greater than 0
+- `channels` must be `1` or `2`
 
 ---
 
-## `runtime` セクション
+## `runtime` section
 
-ランタイム動作の設定です。
+Runtime behavior settings.
 
-| フィールド | 型 | デフォルト | 説明 |
+| Field | Type | Default | Description |
 |---|---|---|---|
-| `monitor_check_interval_ms` | integer | `1000` | モニター変更の検出間隔（ミリ秒） |
-| `shutdown_grace_ms` | integer | `3000` | シャットダウン時のグレース期間（ミリ秒） |
-| `emit_metrics_interval_ms` | integer | `1000` | health.json / metrics.json の書き出し間隔（ミリ秒） |
+| `monitor_check_interval_ms` | integer | `1000` | Interval (ms) for polling monitor configuration changes |
+| `shutdown_grace_ms` | integer | `3000` | Grace period (ms) at shutdown |
+| `emit_metrics_interval_ms` | integer | `1000` | Write interval (ms) of `health.json` and `metrics.json` |
 
-### バリデーション
+### Validation
 
-- すべての値は 1 以上でなければなりません
+- `monitor_check_interval_ms` and `emit_metrics_interval_ms` must be greater than 0
+- `shutdown_grace_ms` must be 0 or greater (the loader's error message says "positive", but `0` is accepted)

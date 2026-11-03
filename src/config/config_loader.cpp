@@ -5,15 +5,10 @@
 
 using json = nlohmann::json;
 
-/**
- * @brief encoder セクションを JSON からパースする
- * @param j   JSON オブジェクト
- * @param cfg 出力先のエンコーダー設定
- */
+/** @brief Parse the "encoder" section; absent keys leave @p cfg unchanged. */
 static void parse_encoder(const json& j, EncoderConfig& cfg) {
     if (j.contains("codec"))           cfg.codec           = j["codec"].get<std::string>();
     if (j.contains("fallback_codecs")) {
-        // fallback_codecs は文字列の配列
         cfg.fallback_codecs.clear();
         for (const auto& item : j["fallback_codecs"]) {
             cfg.fallback_codecs.push_back(item.get<std::string>());
@@ -28,11 +23,7 @@ static void parse_encoder(const json& j, EncoderConfig& cfg) {
     if (j.contains("threads"))         cfg.threads         = j["threads"].get<int>();
 }
 
-/**
- * @brief audio セクションを JSON からパースする
- * @param j   JSON オブジェクト
- * @param cfg 出力先の音声設定
- */
+/** @brief Parse the "audio" section; absent keys leave @p cfg unchanged. */
 static void parse_audio(const json& j, AudioConfig& cfg) {
     if (j.contains("enabled"))       cfg.enabled       = j["enabled"].get<bool>();
     if (j.contains("source"))        cfg.source        = j["source"].get<std::string>();
@@ -42,11 +33,7 @@ static void parse_audio(const json& j, AudioConfig& cfg) {
     if (j.contains("channels"))      cfg.channels       = j["channels"].get<int>();
 }
 
-/**
- * @brief rtsp セクションを JSON からパースする
- * @param j   JSON オブジェクト
- * @param cfg 出力先の RTSP 設定
- */
+/** @brief Parse the "rtsp" section; absent keys leave @p cfg unchanged. */
 static void parse_rtsp(const json& j, RtspConfig& cfg) {
     if (j.contains("base_url"))                    cfg.base_url                    = j["base_url"].get<std::string>();
     if (j.contains("path_pattern"))                cfg.path_pattern                = j["path_pattern"].get<std::string>();
@@ -59,14 +46,12 @@ static void parse_rtsp(const json& j, RtspConfig& cfg) {
 }
 
 bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& error) {
-    // ファイルを開く
     std::ifstream file(path);
     if (!file.is_open()) {
         error = "Cannot open config file: " + path;
         return false;
     }
 
-    // JSON パース
     json j;
     try {
         file >> j;
@@ -76,7 +61,6 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
     }
 
     try {
-        // app セクション
         if (j.contains("app")) {
             const auto& a = j["app"];
             if (a.contains("instance_name")) out.app.instance_name = a["instance_name"].get<std::string>();
@@ -86,23 +70,18 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
             if (a.contains("health_path"))    out.app.health_path    = a["health_path"].get<std::string>();
         }
 
-        // capture セクション
         if (j.contains("capture")) {
             const auto& c = j["capture"];
             if (c.contains("backend"))          out.capture.backend          = c["backend"].get<std::string>();
             if (c.contains("frame_timeout_ms")) out.capture.frame_timeout_ms = c["frame_timeout_ms"].get<int>();
         }
 
-        // encoder セクション
         if (j.contains("encoder")) parse_encoder(j["encoder"], out.encoder);
 
-        // rtsp セクション
         if (j.contains("rtsp")) parse_rtsp(j["rtsp"], out.rtsp);
 
-        // audio セクション（省略時は無効のまま）
         if (j.contains("audio")) parse_audio(j["audio"], out.audio);
 
-        // runtime セクション
         if (j.contains("runtime")) {
             const auto& r = j["runtime"];
             if (r.contains("monitor_check_interval_ms")) out.runtime.monitor_check_interval_ms = r["monitor_check_interval_ms"].get<int>();
@@ -111,46 +90,41 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
         }
 
     } catch (const json::type_error& e) {
-        error = std::string("Config type error (フィールドの型が正しくありません): ") + e.what();
+        error = std::string("Config type error: ") + e.what();
         return false;
     } catch (const json::exception& e) {
         error = std::string("Config read error: ") + e.what();
         return false;
     }
 
-    // --- バリデーション ---
+    // --- Validation ---
 
-    // RTSP base_url が "rtsp://" で始まることを確認
     if (out.rtsp.base_url.empty() || out.rtsp.base_url.rfind("rtsp://", 0) != 0) {
         error = "rtsp.base_url must start with rtsp://";
         return false;
     }
 
-    // エンコーダー FPS の範囲チェック
     if (out.encoder.fps <= 0 || out.encoder.fps > 240) {
         error = "encoder.fps must be between 1 and 240";
         return false;
     }
 
-    // エンコーダービットレートの正値チェック
     if (out.encoder.bitrate_kbps <= 0) {
         error = "encoder.bitrate_kbps must be positive";
         return false;
     }
 
-    // キャプチャバックエンドのチェック (現時点では "dxgi" のみ実装)
     if (out.capture.backend != "dxgi") {
         error = "capture.backend must be \"dxgi\" (only dxgi is currently supported)";
         return false;
     }
 
-    // キャプチャタイムアウトの非負チェック (0 は即時返却)
+    // 0 is allowed: return immediately
     if (out.capture.frame_timeout_ms < 0) {
         error = "capture.frame_timeout_ms must be 0 or positive";
         return false;
     }
 
-    // RTSP タイムアウトの正値チェック
     if (out.rtsp.connect_timeout_ms <= 0) {
         error = "rtsp.connect_timeout_ms must be positive";
         return false;
@@ -160,7 +134,6 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
         return false;
     }
 
-    // 再接続待機時間のチェック
     if (out.rtsp.reconnect_delay_ms <= 0) {
         error = "rtsp.reconnect_delay_ms must be positive";
         return false;
@@ -178,7 +151,7 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
         return false;
     }
 
-    // 音声設定のチェック（無効時はスキップ）
+    // Audio settings are only validated when audio is enabled
     if (out.audio.enabled) {
         AudioSourceKind source_kind;
         if (!parse_audio_source_kind(out.audio.source, source_kind)) {
@@ -199,11 +172,11 @@ bool ConfigLoader::load(const std::string& path, AppConfig& out, std::string& er
         }
     }
 
-    // ランタイム間隔の正値チェック
     if (out.runtime.monitor_check_interval_ms <= 0) {
         error = "runtime.monitor_check_interval_ms must be positive";
         return false;
     }
+    // shutdown_grace_ms may be 0
     if (out.runtime.shutdown_grace_ms < 0) {
         error = "runtime.shutdown_grace_ms must be positive";
         return false;

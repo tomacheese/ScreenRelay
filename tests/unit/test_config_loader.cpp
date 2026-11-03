@@ -6,11 +6,7 @@
 
 namespace fs = std::filesystem;
 
-/**
- * @brief テスト用一時設定ファイルを書き出す
- * @param content JSON 文字列
- * @return 書き出したファイルパス
- */
+// Writes a temporary config file (in the working directory) and returns its path.
 static std::string write_temp_config(const std::string& content) {
     std::string path = "test_config_tmp.json";
     std::ofstream f(path);
@@ -18,15 +14,10 @@ static std::string write_temp_config(const std::string& content) {
     return path;
 }
 
-/**
- * @brief テスト用一時ファイルを削除する
- * @param path 削除するファイルパス
- */
 static void cleanup(const std::string& path) {
     fs::remove(path);
 }
 
-/** @brief 最小限の有効な設定ファイルが読み込めること */
 static void test_load_minimal_valid() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -44,7 +35,6 @@ static void test_load_minimal_valid() {
     printf("[PASS] test_load_minimal_valid\n");
 }
 
-/** @brief 全セクションを含む設定ファイルが読み込めること */
 static void test_load_all_sections() {
     const std::string json = R"({
       "app": {
@@ -88,7 +78,6 @@ static void test_load_all_sections() {
     VERIFY(cfg.capture.backend == "dxgi");
     VERIFY(cfg.encoder.codec == "libx264");
     VERIFY(cfg.encoder.fps == 30);
-    // fallback_codecs が正しく読み込まれること
     VERIFY(cfg.encoder.fallback_codecs.size() == 2);
     VERIFY(cfg.encoder.fallback_codecs[0] == "h264_mf");
     VERIFY(cfg.encoder.fallback_codecs[1] == "libx264");
@@ -97,7 +86,6 @@ static void test_load_all_sections() {
     printf("[PASS] test_load_all_sections\n");
 }
 
-/** @brief ファイルが存在しない場合にエラーになること */
 static void test_missing_file() {
     AppConfig cfg;
     std::string err;
@@ -107,7 +95,6 @@ static void test_missing_file() {
     printf("[PASS] test_missing_file\n");
 }
 
-/** @brief 不正な JSON でエラーになること */
 static void test_invalid_json() {
     auto path = write_temp_config("{invalid json}");
     AppConfig cfg;
@@ -118,7 +105,6 @@ static void test_invalid_json() {
     printf("[PASS] test_invalid_json\n");
 }
 
-/** @brief rtsp.base_url がない場合にエラーになること */
 static void test_missing_rtsp_base_url_fails() {
     const std::string json = R"({
       "encoder": { "fps": 60, "bitrate_kbps": 4000 }
@@ -132,7 +118,6 @@ static void test_missing_rtsp_base_url_fails() {
     printf("[PASS] test_missing_rtsp_base_url_fails\n");
 }
 
-/** @brief fps が範囲外でエラーになること */
 static void test_invalid_fps_fails() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://host:8554" },
@@ -147,7 +132,7 @@ static void test_invalid_fps_fails() {
     printf("[PASS] test_invalid_fps_fails\n");
 }
 
-/** @brief 未実装のキャプチャバックエンドを指定した場合にエラーになること */
+// "wgc" is not a supported capture backend
 static void test_invalid_backend_fails() {
     const std::string json = R"({
       "capture": { "backend": "wgc" },
@@ -163,7 +148,6 @@ static void test_invalid_backend_fails() {
     printf("[PASS] test_invalid_backend_fails\n");
 }
 
-/** @brief base_url が "rtsp://" で始まらない場合にエラーになること */
 static void test_invalid_rtsp_url_prefix_fails() {
     const std::string json = R"({
       "rtsp": { "base_url": "http://192.168.0.100:8554" },
@@ -178,7 +162,7 @@ static void test_invalid_rtsp_url_prefix_fails() {
     printf("[PASS] test_invalid_rtsp_url_prefix_fails\n");
 }
 
-/** @brief audio セクションが省略された場合は無効のままロードされること */
+// A missing audio section loads with audio disabled
 static void test_audio_default_disabled() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -194,7 +178,6 @@ static void test_audio_default_disabled() {
     printf("[PASS] test_audio_default_disabled\n");
 }
 
-/** @brief audio セクションが正しくパースされること */
 static void test_audio_parses_all_fields() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -223,7 +206,6 @@ static void test_audio_parses_all_fields() {
     printf("[PASS] test_audio_parses_all_fields\n");
 }
 
-/** @brief audio.source が不正な値の場合にエラーになること */
 static void test_audio_invalid_source_fails() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -239,7 +221,6 @@ static void test_audio_invalid_source_fails() {
     printf("[PASS] test_audio_invalid_source_fails\n");
 }
 
-/** @brief audio.channels が 1/2 以外の場合にエラーになること */
 static void test_audio_invalid_channels_fails() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -255,7 +236,6 @@ static void test_audio_invalid_channels_fails() {
     printf("[PASS] test_audio_invalid_channels_fails\n");
 }
 
-/** @brief audio.bitrate_kbps が 0 以下の場合にエラーになること */
 static void test_audio_invalid_bitrate_fails() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -271,7 +251,6 @@ static void test_audio_invalid_bitrate_fails() {
     printf("[PASS] test_audio_invalid_bitrate_fails\n");
 }
 
-/** @brief audio.sample_rate が 0 以下の場合にエラーになること */
 static void test_audio_invalid_sample_rate_fails() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -287,7 +266,7 @@ static void test_audio_invalid_sample_rate_fails() {
     printf("[PASS] test_audio_invalid_sample_rate_fails\n");
 }
 
-/** @brief 無効時は audio セクションが不正でも検証をスキップすること */
+// Invalid audio values are ignored while audio.enabled is false
 static void test_audio_disabled_skips_validation() {
     const std::string json = R"({
       "rtsp": { "base_url": "rtsp://192.168.0.100:8554" },
@@ -304,8 +283,8 @@ static void test_audio_disabled_skips_validation() {
 }
 
 /**
- * @brief ConfigLoader のユニットテストを実行する
- * @return 成功時 0 (失敗時は VERIFY マクロにより exit(1))
+ * @brief Tests ConfigLoader.
+ * @return 0 on success (a failing VERIFY exits with status 1)
  */
 int run_config_loader_tests() {
     printf("=== Config Loader Tests ===\n");

@@ -13,42 +13,37 @@
 #include <vector>
 
 /**
- * @brief 音声パケットを 1 コンシューマー分だけ保持する境界キュー
+ * @brief Bounded packet queue for a single audio consumer.
  *
- * AudioPipeline は 1 つの共有音声ストリームを複数の ScreenPipeline へ配信
- * (ブロードキャスト) するため、購読者ごとに独立したキューを持たせる。
- * 各 ScreenPipeline は自身の RTSP 接続状況に応じて任意のタイミングで
- * try_pop / wait_pop できる。
+ * AudioPipeline broadcasts one shared audio stream to several ScreenPipelines, so each
+ * subscriber gets its own queue and can pop at its own pace, depending on its RTSP
+ * connection state.
  */
 class AudioSubscriberQueue {
 public:
     /**
-     * @brief パケットをキューへ追加する
-     *
-     * キューが最大サイズを超える場合は最古パケットを破棄する
-     * (購読側の消費が追いつかない場合でも配信スレッドをブロックしないため)。
-     *
-     * @param pkt 追加するパケット
+     * @brief Appends a packet, dropping the oldest on overflow so a slow subscriber
+     *        never blocks the pipeline thread.
      */
     void push(const EncodedPacket& pkt);
 
     /**
-     * @brief パケットをノンブロッキングで取得する
-     * @param[out] out 取得したパケット
-     * @return 取得できた場合 true
+     * @brief Non-blocking pop.
+     * @param[out] out Popped packet
+     * @return true if a packet was available
      */
     bool try_pop(EncodedPacket& out);
 
     /**
-     * @brief パケットをタイムアウト付きで取得する
-     * @param[out] out       取得したパケット
-     * @param      timeout_ms タイムアウト (ms)
-     * @return 取得できた場合 true、タイムアウトなら false
+     * @brief Pops a packet, waiting up to timeout_ms.
+     * @param[out] out       Popped packet
+     * @param      timeout_ms Timeout (ms)
+     * @return true if a packet was popped, false on timeout
      */
     bool wait_pop(EncodedPacket& out, int timeout_ms);
 
 private:
-    /** キューの最大サイズ。超過した場合は最古パケットを破棄する */
+    /** Queue capacity; the oldest packet is dropped on overflow. */
     static constexpr int kMaxQueueSize = 64;
 
     mutable std::mutex mutex_;
@@ -57,65 +52,50 @@ private:
 };
 
 /**
- * @brief 共有音声キャプチャ・エンコードパイプライン
+ * @brief Shared audio capture and encode pipeline.
  *
- * WasapiAudioCapture でキャプチャした PCM を AudioEncoderController で AAC に
- * エンコードし、購読中のすべての AudioSubscriberQueue へブロードキャストする。
- * 全モニターの RTSP ストリームに同一の音声を配信するため、モニター数に関係なく
- * インスタンスは 1 つだけ生成される。
+ * Encodes PCM captured by WasapiAudioCapture to AAC with AudioEncoderController and
+ * broadcasts it to every subscribed AudioSubscriberQueue. All monitors' RTSP streams
+ * carry the same audio, so only one instance exists regardless of monitor count.
  */
 class AudioPipeline {
 public:
-    /** @brief コンストラクタ */
     AudioPipeline();
 
-    /** @brief デストラクタ。実行中の場合は stop() を呼び出す */
     ~AudioPipeline();
 
     /**
-     * @brief キャプチャ・エンコードを初期化してバックグラウンドスレッドを開始する
-     * @param config 音声設定
-     * @param error  エラーメッセージ出力先
-     * @param log    エンコード失敗などをログ出力するためのシンク (nullptr の場合はログを出力しない)
-     * @return 成功した場合 true
+     * @brief Initializes capture and encoder and starts the pipeline thread.
+     *        Returns true without doing anything if already running.
+     * @param config Audio settings
+     * @param error  Receives an error message on failure
+     * @param log    Sink for encode failures etc. (nullptr disables logging)
+     * @return true on success
      */
     bool start(const AudioConfig& config, std::string& error,
                std::shared_ptr<LogSink> log = nullptr);
 
-    /** @brief バックグラウンドスレッドを停止してリソースを解放する */
+    /** @brief Stops the thread and releases capture/encoder resources. */
     void stop();
 
-    /** @brief パイプラインが実行中かどうかを返す */
+    /** @brief Whether the pipeline is running; becomes false if capture hits a hard error. */
     bool is_running() const { return running_.load(); }
 
-    /**
-     * @brief RTSP ストリーム初期化用のコーデック情報を取得する
-     *
-     * start() が成功した後にのみ有効な値を返す。
-     *
-     * @return 音声コーデック情報
-     */
+    /** @brief Codec parameters for RTSP stream setup; valid only after a successful start(). */
     AudioCodecInfo get_codec_info() const;
 
-    /**
-     * @brief 新しい購読者を登録する
-     * @return 購読用キュー (ScreenPipeline が保持し、pop に使用する)
-     */
+    /** @brief Registers a subscriber and returns its queue (held by the ScreenPipeline). */
     std::shared_ptr<AudioSubscriberQueue> subscribe();
 
-    /**
-     * @brief 購読を解除する
-     * @param queue subscribe() で取得したキュー
-     */
+    /** @brief Removes a subscriber; @p queue is the value returned by subscribe(). */
     void unsubscribe(const std::shared_ptr<AudioSubscriberQueue>& queue);
 
 private:
-    /** @brief バックグラウンドキャプチャ・エンコードスレッドのエントリポイント */
     void pipeline_thread_func();
 
-    WasapiAudioCapture     capture_;  ///< WASAPI キャプチャバックエンド
-    AudioEncoderController encoder_;  ///< AAC エンコーダー
-    std::shared_ptr<LogSink> log_;    ///< エンコード失敗等の記録先 (nullptr 可)
+    WasapiAudioCapture     capture_;  ///< WASAPI capture backend
+    AudioEncoderController encoder_;  ///< AAC encoder
+    std::shared_ptr<LogSink> log_;    ///< Encode failure sink (may be null)
 
     std::atomic<bool> running_{false};
     std::thread        thread_;

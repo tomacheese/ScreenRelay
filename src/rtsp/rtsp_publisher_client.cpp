@@ -13,18 +13,14 @@ extern "C" {
 #include "rtsp/rtsp_publisher_client.hpp"
 #include <cstring>
 
-/**
- * @brief RtspPublisherClient の内部実装
- *
- * FFmpeg の AVFormatContext・AVStream・AVPacket を保持する。
- */
+/** @brief FFmpeg format context, streams and reusable packets. */
 struct RtspPublisherClient::Impl {
-    AVFormatContext* fmt_ctx      = nullptr;  ///< フォーマットコンテキスト
-    AVStream*        video_stream = nullptr;  ///< ビデオストリーム
-    AVStream*        audio_stream = nullptr;  ///< 音声ストリーム (未使用時は nullptr)
-    AVPacket*        pkt          = nullptr;  ///< 再利用可能なパケット (ビデオ用)
-    AVPacket*        audio_pkt    = nullptr;  ///< 再利用可能なパケット (音声用)
-    int              fps          = 60;       ///< フレームレート (タイムスタンプ変換用)
+    AVFormatContext* fmt_ctx      = nullptr;  ///< Format context
+    AVStream*        video_stream = nullptr;  ///< Video stream
+    AVStream*        audio_stream = nullptr;  ///< Audio stream (nullptr if unused)
+    AVPacket*        pkt          = nullptr;  ///< Reusable video packet
+    AVPacket*        audio_pkt    = nullptr;  ///< Reusable audio packet
+    int              fps          = 60;       ///< Frame rate from codec_info
 };
 
 RtspPublisherClient::RtspPublisherClient()
@@ -51,7 +47,6 @@ bool RtspPublisherClient::connect(const std::string& url,
         return false;
     }
 
-    // ビデオストリームを追加する
     AVStream* st = avformat_new_stream(fmt_ctx, nullptr);
     if (!st) {
         avformat_free_context(fmt_ctx);
@@ -82,7 +77,6 @@ bool RtspPublisherClient::connect(const std::string& url,
             static_cast<int>(codec_info.extradata.size());
     }
 
-    // 音声ストリームを追加する (audio_info が渡された場合のみ)
     AVStream* audio_st = nullptr;
     if (audio_info) {
         audio_st = avformat_new_stream(fmt_ctx, nullptr);
@@ -116,10 +110,10 @@ bool RtspPublisherClient::connect(const std::string& url,
         }
     }
 
-    // RTCP SR のウォールクロック基点を PTS=0 に対応する実時刻に設定する。
-    // 再接続時は最初のフレームの時刻 (stream_start_us) を使うことで、
-    // PTS が frame_count ベースでなく実キャプチャ時刻ベースになった後も
-    // VLC 等の受信側に一貫した NTP-RTP 対応を提供する。
+    // Wall-clock origin for RTCP SR: the real time corresponding to PTS=0. On
+    // reconnect, stream_start_us (the first frame's time) is used so receivers such
+    // as VLC keep a consistent NTP-RTP mapping now that PTS follows capture time
+    // rather than a frame count.
     fmt_ctx->start_time_realtime = (codec_info.stream_start_us != 0)
         ? codec_info.stream_start_us
         : av_gettime();
@@ -127,7 +121,7 @@ bool RtspPublisherClient::connect(const std::string& url,
     AVDictionary* opts = nullptr;
     av_dict_set(&opts, "rtsp_transport", "tcp", 0);
 
-    // タイムアウトはマイクロ秒単位で設定する
+    // The timeout option is in microseconds
     char timeout_str[32];
     snprintf(timeout_str, sizeof(timeout_str), "%d",
              config.connect_timeout_ms * 1000);
@@ -149,7 +143,7 @@ bool RtspPublisherClient::connect(const std::string& url,
     impl_->fps          = codec_info.fps;
     connected_.store(true);
 
-    // パケット送信ごとのヒープ割り当てを避けるため再利用可能な AVPacket を確保する
+    // Reusable packets avoid a heap allocation per sent packet
     impl_->pkt = av_packet_alloc();
     impl_->audio_pkt = audio_st ? av_packet_alloc() : nullptr;
     if (!impl_->pkt || (audio_st && !impl_->audio_pkt)) {
@@ -165,7 +159,7 @@ bool RtspPublisherClient::connect(const std::string& url,
         return false;
     }
 
-    // 書き込みタイムアウトを設定して av_interleaved_write_frame が無限ブロックしないようにする
+    // Write timeout (applies after the header) so av_interleaved_write_frame cannot block forever
     if (impl_->fmt_ctx->pb)
         av_opt_set_int(impl_->fmt_ctx->pb, "rw_timeout",
                        static_cast<int64_t>(config.send_timeout_ms) * 1000,
@@ -178,7 +172,7 @@ bool RtspPublisherClient::send_packet(const EncodedPacket& pkt) {
     if (!connected_.load() || !impl_->fmt_ctx || !impl_->video_stream || !impl_->pkt) return false;
 
     AVPacket* av_pkt = impl_->pkt;
-    av_packet_unref(av_pkt);  // 前回のデータバッファを解放する (未使用時は no-op)
+    av_packet_unref(av_pkt);  // release the previous data buffer (no-op if unused)
 
     int ret = av_new_packet(av_pkt, static_cast<int>(pkt.data.size()));
     if (ret < 0) { return false; }
@@ -191,13 +185,12 @@ bool RtspPublisherClient::send_packet(const EncodedPacket& pkt) {
 
     if (pkt.is_key_frame) av_pkt->flags |= AV_PKT_FLAG_KEY;
 
-    // エンコーダーのタイムベースからストリームのタイムベースに変換する
     AVRational enc_tb = {pkt.time_base_num, pkt.time_base_den};
     av_packet_rescale_ts(av_pkt, enc_tb, impl_->video_stream->time_base);
 
     ret = av_interleaved_write_frame(impl_->fmt_ctx, av_pkt);
-    // av_interleaved_write_frame は所有権を取得して unref するため、
-    // パケット構造体はそのまま再利用できる
+    // av_interleaved_write_frame takes ownership and unrefs the packet, so the
+    // AVPacket struct can be reused as-is
 
     if (ret < 0) {
         connected_.store(false);
@@ -212,7 +205,7 @@ bool RtspPublisherClient::send_audio_packet(const EncodedPacket& pkt) {
         return false;
 
     AVPacket* av_pkt = impl_->audio_pkt;
-    av_packet_unref(av_pkt);  // 前回のデータバッファを解放する (未使用時は no-op)
+    av_packet_unref(av_pkt);  // release the previous data buffer (no-op if unused)
 
     int ret = av_new_packet(av_pkt, static_cast<int>(pkt.data.size()));
     if (ret < 0) { return false; }
@@ -222,7 +215,7 @@ bool RtspPublisherClient::send_audio_packet(const EncodedPacket& pkt) {
     av_pkt->dts          = pkt.dts;
     av_pkt->duration     = pkt.duration;
     av_pkt->stream_index = impl_->audio_stream->index;
-    av_pkt->flags       |= AV_PKT_FLAG_KEY;  // AAC は全フレームが独立デコード可能
+    av_pkt->flags       |= AV_PKT_FLAG_KEY;  // every AAC frame is independently decodable
 
     AVRational enc_tb = {pkt.time_base_num, pkt.time_base_den};
     av_packet_rescale_ts(av_pkt, enc_tb, impl_->audio_stream->time_base);
@@ -247,8 +240,8 @@ void RtspPublisherClient::disconnect() {
     if (connected_.load()) {
         av_write_trailer(impl_->fmt_ctx);
     }
-    // フォーマットコンテキストを解放する前に AVIOContext を明示的にクローズして
-    // ソケット/ハンドルのリークと再接続時の干渉を防ぐ
+    // Close the AVIOContext explicitly before freeing the format context to avoid
+    // leaking the socket/handle and interfering with a later reconnect
     if (impl_->fmt_ctx->pb && impl_->fmt_ctx->oformat &&
         !(impl_->fmt_ctx->oformat->flags & AVFMT_NOFILE)) {
         avio_closep(&impl_->fmt_ctx->pb);

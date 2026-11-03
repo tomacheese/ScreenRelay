@@ -1,163 +1,152 @@
-# ビルド手順
+# Build instructions
 
-## 前提条件
+screen-relay builds on Windows with MinGW-w64 GCC. It links against Win32 libraries (`d3d11`, `dxgi`, …) and cannot be built on Linux or macOS.
 
-| ツール | バージョン | 備考 |
+## Prerequisites
+
+| Tool | Version | Notes |
 |---|---|---|
-| GCC (MinGW-w64) | 13.0 以上（15.x 推奨） | `gcc --version` で確認 |
-| CMake | 3.25 以上 | `cmake --version` で確認 |
-| Ninja | 1.11 以上 | `ninja --version` で確認 |
-| FFmpeg | LGPL shared ビルド | 後述の配置手順を参照 |
+| GCC (MinGW-w64) | 13 or newer recommended | Check with `gcc --version` |
+| CMake | 3.20 or newer | Check with `cmake --version` |
+| Ninja | Any recent version | Check with `ninja --version` |
+| FFmpeg | LGPL shared build (avcodec ≥ 62) | See below |
 
-> **注意**: MSVC はサポートしていません。必ず MinGW-w64 ツールチェーンを使用してください。
+> **Note**: MSVC is not supported. Use the MinGW-w64 toolchain.
+
+spdlog (v1.15.1) and nlohmann/json (v3.12.0) are downloaded automatically by CMake `FetchContent` during configuration, so the first configure needs network access.
 
 ---
 
-## FFmpeg の配置
+## Setting up FFmpeg
 
-FFmpeg の LGPL shared ビルドを `deps/ffmpeg/` に配置します。
+CMake looks for FFmpeg in this order:
+
+1. pkg-config (`libavcodec libavformat libavutil libswscale libswresample`). On MSYS2: `pacman -S mingw-w64-x86_64-ffmpeg`.
+2. `deps/ffmpeg/` (or the path given by `-DFFMPEG_ROOT=<path>`).
+
+For option 2, place an LGPL shared build of FFmpeg in `deps/ffmpeg/`. Prebuilt binaries are available from [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases): download a `*-win64-lgpl-shared*.zip` and extract its contents (`bin/`, `include/`, `lib/`) into `deps/ffmpeg/`.
 
 ```text
 deps/
 └── ffmpeg/
+    ├── bin/          # *.dll (needed at run time)
     ├── include/
     │   ├── libavcodec/
     │   ├── libavformat/
     │   ├── libavutil/
-    │   └── libswscale/
+    │   ├── libswscale/
+    │   └── libswresample/
     └── lib/
         ├── libavcodec.dll.a
         ├── libavformat.dll.a
         ├── libavutil.dll.a
-        └── libswscale.dll.a
+        ├── libswscale.dll.a
+        └── libswresample.dll.a
 ```
 
-FFmpeg のビルド済みバイナリは [BtbN/FFmpeg-Builds](https://github.com/BtbN/FFmpeg-Builds/releases) から入手できます。  
-`ffmpeg-n*-win64-lgpl-shared-*.zip` をダウンロードし、`include/` と `lib/` を上記のパスに展開してください。
+`deps/ffmpeg/` is gitignored; do not commit it.
 
 ---
 
-## CMake 設定
-
-MinGW ツールチェーンを使用して CMake を設定します。
+## Configure
 
 ```bash
-cmake -B build \
-  -G Ninja \
+cmake -B build -G Ninja \
   -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw.cmake \
-  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_BUILD_TYPE=Release \
+  -DBUILD_TESTS=ON
 ```
 
-デバッグビルドの場合:
+For a debug build, use `-DCMAKE_BUILD_TYPE=Debug`. `BUILD_TESTS` defaults to `ON`.
 
-```bash
-cmake -B build \
-  -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw.cmake \
-  -DCMAKE_BUILD_TYPE=Debug
-```
+`toolchain-mingw.cmake` expects the MinGW compilers in `/mingw64/bin` (the MSYS2 MINGW64 default). Override with `-DMINGW_BIN=<path>` (and `-DMINGW_ROOT=<path>` for the find root), or with the `MINGW_BIN` / `MINGW_ROOT` environment variables.
 
 ---
 
-## ビルド
-
-### 全ターゲットをビルド
+## Build
 
 ```bash
+# All targets
 cmake --build build
-```
 
-### 個別ターゲットのビルド
-
-```bash
-# メインバイナリのみ
+# Main binary only
 cmake --build build --target screen-relay
 
-# テストバイナリのみ
+# Test binary only
 cmake --build build --target screen_relay_tests
 ```
 
-ビルド成功後、以下のファイルが生成されます。
+The outputs are:
 
 ```text
 build/
 ├── screen-relay.exe
-└── screen_relay_tests.exe
+└── tests/
+    └── screen_relay_tests.exe
 ```
 
 ---
 
-## FFmpeg DLL のコピー
+## FFmpeg DLLs
 
-実行時に FFmpeg の DLL が必要です。ビルドディレクトリにコピーしてください。
+FFmpeg's DLLs must be findable at run time. Copy them next to the executable:
 
 ```bash
-# Windows (Git Bash)
+# Git Bash / MSYS2
 cp deps/ffmpeg/bin/*.dll build/
 ```
 
-または CMake のインストールターゲットを使用:
+When FFmpeg comes from MSYS2 (pkg-config), the DLLs are already in `/mingw64/bin`. Release packages (built by CI) also bundle `libwinpthread-1.dll` and `THIRD_PARTY_LICENSES.md`.
+
+---
+
+## Running the tests
+
+The test runner is a plain executable (no framework). It needs the FFmpeg DLLs on `PATH`:
 
 ```bash
-cmake --build build --target install
+export PATH="$PWD/deps/ffmpeg/bin:$PATH"
+./build/tests/screen_relay_tests.exe
 ```
 
-`build/` に以下の DLL が配置されます（バージョンは FFmpeg のビルドに依存）。
+A successful run ends with `All tests passed.`. The same executable is also registered with CTest from the `tests/` directory:
 
-```text
-build/
-├── screen-relay.exe
-├── screen_relay_tests.exe
-├── avcodec-*.dll
-├── avformat-*.dll
-├── avutil-*.dll
-└── swscale-*.dll
+```bash
+ctest --test-dir build/tests --output-on-failure
 ```
 
 ---
 
-## テストの実行
+## CMake targets
 
-```bash
-cd build
-./screen_relay_tests.exe
-```
-
-または CTest を使用:
-
-```bash
-ctest --test-dir build --output-on-failure
-```
-
----
-
-## CMake ターゲット一覧
-
-| ターゲット | 種別 | 説明 |
+| Target | Type | Description |
 |---|---|---|
-| `screen_relay_lib` | 静的ライブラリ | コアロジック。`screen-relay` と `screen_relay_tests` が共有する |
-| `screen-relay` | 実行ファイル | メインアプリケーション (`screen-relay.exe`) |
-| `screen_relay_tests` | 実行ファイル | 単体テスト (`screen_relay_tests.exe`) |
+| `screen_relay_lib` | Static library | Core logic, shared by `screen-relay` and `screen_relay_tests` |
+| `screen-relay` | Executable | The application (`screen-relay.exe`) |
+| `screen_relay_tests` | Executable | Unit tests (`screen_relay_tests.exe`) |
 
 ---
 
-## トラブルシューティング
+## Troubleshooting
 
-### `libavcodec.dll.a` が見つからないと言われる
+### CMake cannot find FFmpeg
 
-FFmpeg の `lib/` ディレクトリが正しく配置されているか確認してください。  
-インポートライブラリ（`.dll.a`）は shared ビルドのみに含まれます。static ビルドでは異なるファイル名になります。
+The configure step fails with `FFmpeg not found`. Install FFmpeg through MSYS2, or check that `deps/ffmpeg/include` exists (or pass `-DFFMPEG_ROOT=<path>`).
 
-### `cc1: error: unrecognized command-line option` が出る
+### `libavcodec.dll.a` is missing
 
-MinGW-w64 のバージョンが古い可能性があります。GCC 13.0 以上（15.x 推奨）を使用してください。
+Check that `deps/ffmpeg/lib` is populated. Import libraries (`.dll.a`) are only part of the shared builds; static builds use different file names.
 
-### Ninja が見つからないと言われる
+### `cc1: error: unrecognized command-line option`
+
+Your MinGW-w64 GCC is probably too old. Use GCC 13 or newer.
+
+### Ninja is not found
 
 ```bash
-# Scoop を使用している場合
+# With Scoop
 scoop install ninja
 
-# または CMake の -G オプションを "MinGW Makefiles" に変更
+# Or use the MinGW Makefiles generator instead
 cmake -B build -G "MinGW Makefiles" -DCMAKE_TOOLCHAIN_FILE=toolchain-mingw.cmake
 ```

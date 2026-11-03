@@ -61,8 +61,8 @@ bool AudioPipeline::start(const AudioConfig& config, std::string& error,
 }
 
 void AudioPipeline::stop() {
-    // running_ はハードエラー発生時にスレッド自身が false へ落とすことがあるため、
-    // ここでの判定に使わず thread_.joinable() で二重解放を防ぐ。
+    // The thread may clear running_ itself on a hard error, so running_ cannot
+    // gate cleanup here; thread_.joinable() guards against double join.
     running_.store(false);
     if (thread_.joinable()) thread_.join();
     encoder_.reset();
@@ -92,15 +92,14 @@ void AudioPipeline::pipeline_thread_func() {
     AudioBuffer buf;
     AudioMeta   meta;
     std::vector<EncodedPacket> packets;
-    bool encode_failing = false;  // 連続失敗中はログを 1 度だけ出し、復帰時にも 1 度だけ記録する
+    bool encode_failing = false;  // log once when failures start and once on recovery
 
     while (running_.load()) {
         if (capture_.has_hard_error()) {
-            // キャプチャデバイスが失われた場合、音声配信のみ停止して再試行はしない。
-            // 映像パイプラインへの影響を避けるため、ここではプロセス全体を落とさない。
-            // running_ を false にしておかないと is_running() が true のまま残り、
-            // 呼び出し側が「音声配信中」と誤認して RTSP に存在しないストリームを
-            // 告知し続けてしまう。
+            // Capture device lost: stop audio only, with no retry, and leave the
+            // process (and video) running. running_ must be cleared so is_running()
+            // does not report audio as live and callers keep advertising a stream
+            // that no longer exists.
             running_.store(false);
             break;
         }

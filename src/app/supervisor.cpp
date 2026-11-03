@@ -23,16 +23,14 @@ ScreenPipeline::ScreenPipeline(const MonitorInfo& info, const AppConfig& config,
     , log_(std::move(log))
     , metrics_(std::move(metrics))
     , audio_pipeline_(std::move(audio_pipeline)) {
-    // ステート遷移コールバックを登録する
     state_machine_.on_transition([this](PipelineState from, PipelineState to) {
         log_->log_state_changed(monitor_info_.number,
                                 state_name(from), state_name(to));
         metrics_->set_state(monitor_info_.number, state_name(to));
     });
 
-    // 音声配信が有効な場合、共有音声パイプラインを購読する。
-    // 全モニターの RTSP ストリームに同一の音声を配信するため、
-    // パイプラインの生存期間を通じて購読を維持する。
+    // Subscribe to the shared audio pipeline (same audio goes to every monitor's
+    // streams); the subscription lasts for this pipeline's lifetime.
     if (audio_pipeline_) {
         audio_queue_ = audio_pipeline_->subscribe();
     }
@@ -65,10 +63,12 @@ void ScreenPipeline::notify_resized(int new_width, int new_height) {
 }
 
 /**
- * @brief DXGI キャプチャバックエンドをリトライ付きで初期化する
+ * @brief Init the capture backend with a bounded retry loop.
  *
- * do_init_and_capture() / do_reconfigure() で共用する共通ヘルパー。
- * 200ms 間隔で最大 15 回リトライし、stop_requested_ が立てば途中で打ち切る。
+ * Right after a resolution change, or when another monitor on the same GPU is
+ * reconfiguring, DuplicateOutput can fail with E_ACCESSDENIED (0x80070005)
+ * while the display driver settles; it usually succeeds on the 2nd retry.
+ * Aborts early once stop_requested_ is set.
  */
 bool ScreenPipeline::init_capture_with_retry(ICaptureBackend* backend,
                                                int width, int height) {
@@ -83,12 +83,7 @@ bool ScreenPipeline::init_capture_with_retry(ICaptureBackend* backend,
     return false;
 }
 
-/**
- * @brief RTSP URL を生成する
- *
- * path_pattern 内の {n} をモニター番号に置換する。
- * プライマリモニターの場合は screen0 エイリアスも追加する。
- */
+/** Replaces {n} in path_pattern with the monitor number; the primary monitor also gets a number-0 alias. */
 std::vector<std::string> ScreenPipeline::make_rtsp_urls() const {
     auto make_url = [&](int n) {
         std::string path = config_.rtsp.path_pattern;
@@ -101,20 +96,17 @@ std::vector<std::string> ScreenPipeline::make_rtsp_urls() const {
     std::vector<std::string> urls;
     urls.push_back(make_url(monitor_info_.number));
     if (monitor_info_.is_primary)
-        urls.push_back(make_url(0));  // screen0 エイリアス
+        urls.push_back(make_url(0));
     return urls;
 }
 
 /**
- * @brief DXGI キャプチャと FramePump を初期化する
+ * @brief Init DXGI capture and FramePump, then wait for the first frame (INIT -> CAPTURING).
  *
- * 失敗した場合は FATAL ステートに遷移して false を返す。
+ * Any failure moves the pipeline to FATAL (or leaves state unchanged if the
+ * CAPTURING transition itself is rejected) and returns false.
  */
 bool ScreenPipeline::do_init_and_capture() {
-    // DXGI キャプチャバックエンドを初期化する。
-    // 解像度変更直後や GPU を共有する別モニターの RECONFIGURING と競合した場合、
-    // DuplicateOutput が E_ACCESSDENIED を返すことがある。
-    // do_reconfigure() と同様に 200ms 間隔で最大 15 回リトライする。
     auto backend = std::make_unique<DxgiCaptureBackend>();
     if (!init_capture_with_retry(backend.get(),
                                   monitor_info_.logical_width,
@@ -132,7 +124,6 @@ bool ScreenPipeline::do_init_and_capture() {
     }
     capture_backend_ = std::move(backend);
 
-    // FramePump を開始する
     frame_pump_ = std::make_unique<FramePump>();
     frame_pump_->start(capture_backend_.get(), config_.capture.frame_timeout_ms);
 
@@ -143,9 +134,8 @@ bool ScreenPipeline::do_init_and_capture() {
         return false;
     }
 
-    // 最初のフレームを待って解像度を確認する。
-    // DXGI は画面変化がなくても DuplicateOutput 直後の最初のフレームは返すが、
-    // 高負荷時や静止画面では時間がかかる場合があるため十分な時間を与える。
+    // Wait for the first frame to learn the actual resolution. It can be slow
+    // under load, hence the generous timeout (frame_timeout_ms * 100).
     FrameBuffer buf;
     FrameMeta   meta;
     bool got_frame = frame_pump_->wait_pop(buf, meta,
@@ -167,34 +157,31 @@ bool ScreenPipeline::do_init_and_capture() {
     current_height_ = static_cast<int>(buf.height);
     metrics_->set_resolution(monitor_info_.number, current_width_, current_height_);
 
-    // 初期フリーズフレームとして保存する。
-    // DXGI Desktop Duplication は画面に変化がない限り次のフレームを返さないため、
-    // do_streaming_loop() の freeze_buf がアイドルモニターで長時間空のままになる
-    // （結果としてストリームが真っ暗になる）問題を防ぐ。
-    // このフレームは GPU ゼロコピーモード切り替え前（CPU パス）で取得されるため
-    // gpu_texture は null だが、encode_gpu_zero_copy() が UpdateSubresource で
-    // 対応するため問題ない。
-    initial_frame_buf_  = std::move(buf);   // buf は以降不要のため move して不要なコピーを避ける
+    // Keep it as the initial freeze frame: Desktop Duplication returns no new
+    // frame until the screen changes, so on an idle monitor the stream would
+    // otherwise stay black. This frame was captured before the switch to GPU
+    // zero-copy mode, so gpu_texture is null; encode_gpu_zero_copy() handles
+    // that via UpdateSubresource.
+    initial_frame_buf_  = std::move(buf);
     initial_frame_meta_ = meta;
 
     return true;
 }
 
 /**
- * @brief エンコーダーと RTSP クライアントを初期化して接続する
+ * @brief Init the encoder and RTSP clients and connect (CAPTURING -> CONNECTING -> STREAMING).
  *
- * エンコーダー初期化失敗は FATAL、RTSP 接続失敗は CAPTURING に戻す。
+ * Encoder init failure goes to FATAL; RTSP connect failure goes back to
+ * CAPTURING so the caller can retry.
  */
 bool ScreenPipeline::do_connect() {
-    // CAPTURING → CONNECTING に遷移する
     if (!state_machine_.transition_to(PipelineState::CONNECTING)) {
         log_->log_error("STATE_TRANSITION_FAILED", "Cannot transition to CONNECTING");
         return false;
     }
 
-    // エンコーダーを初期化する
-    // GPU ゼロコピーパスを有効化できるか試すため、キャプチャバックエンドが
-    // 物理解像度=論理解像度（スケーリング不要）の場合に限り D3D11 デバイスを共有する
+    // Share the D3D11 device with the encoder only if the backend supports
+    // zero-copy (physical resolution == logical resolution, no scaling needed).
     void* shared_d3d11_device = nullptr;
     if (capture_backend_->supports_zero_copy()) {
         shared_d3d11_device = capture_backend_->gpu_device();
@@ -216,8 +203,8 @@ bool ScreenPipeline::do_connect() {
         return false;
     }
 
-    // エンコーダーが GPU ゼロコピーパスを確立できた場合のみキャプチャ側を
-    // ゼロコピーモードに切り替える（CPU 側の色空間変換・読み戻しを完全に省略する）
+    // Switch capture to zero-copy mode only if the encoder established the
+    // zero-copy path (skips CPU colour conversion and readback entirely).
     const bool gpu_zero_copy = encoder_->is_gpu_zero_copy_active();
     capture_backend_->set_zero_copy_mode(gpu_zero_copy);
     log_->log_event(spdlog::level::info, "gpu_zero_copy_mode",
@@ -232,20 +219,16 @@ bool ScreenPipeline::do_connect() {
                                    config_.encoder.bitrate_kbps);
     metrics_->set_encoder_codec(monitor_info_.number, actual_codec);
 
-    // RTSP クライアントを接続する
     auto codec_info = encoder_->get_codec_info();
-    // RTCP SR の NTP 基点を明示的に現在時刻へ固定する。
-    // RtspPublisherClient::connect() は stream_start_us が 0 の場合 av_gettime() に
-    // フォールバックするが、音声 pts の再計算にも同じ基準を使う必要があるため、
-    // ここで確定させて共有する。
+    // Fix the RTCP SR NTP base here. connect() would fall back to av_gettime()
+    // when stream_start_us is 0, but audio pts recomputation needs the same base.
     const int64_t connect_wallclock_us = time_utils::system_now_us();
     codec_info.stream_start_us = connect_wallclock_us;
     auto urls = make_rtsp_urls();
     rtsp_clients_.clear();
 
-    // 共有音声パイプラインが稼働中であれば、そのコーデック情報を全 RTSP
-    // ストリームに付与する。音声 pts の再計算は connect_wallclock_us
-    // （RTCP SR の NTP 基点）を基準にすることで映像との同期を保つ。
+    // If the shared audio pipeline is running, add its audio stream to every RTSP
+    // stream; audio pts is computed relative to connect_wallclock_us to stay in sync with video.
     bool has_audio = (audio_pipeline_ && audio_pipeline_->is_running());
     AudioCodecInfo audio_info;
     if (has_audio) {
@@ -264,7 +247,6 @@ bool ScreenPipeline::do_connect() {
                              {"monitor", std::to_string(monitor_info_.number)}});
             rtsp_clients_.clear();
             encoder_.reset();
-            // RTSP 接続失敗は CAPTURING に戻してリトライ可能にする
             if (!state_machine_.transition_to(PipelineState::CAPTURING)) {
                 log_->log_error("STATE_TRANSITION_FAILED",
                                 "Cannot transition to CAPTURING after RTSP connect failure");
@@ -278,7 +260,6 @@ bool ScreenPipeline::do_connect() {
         rtsp_clients_.push_back(std::move(client));
     }
 
-    // STREAMING に遷移する
     if (!state_machine_.transition_to(PipelineState::STREAMING)) {
         log_->log_error("STATE_TRANSITION_FAILED", "Cannot transition to STREAMING");
         rtsp_clients_.clear();
@@ -291,46 +272,39 @@ bool ScreenPipeline::do_connect() {
 }
 
 /**
- * @brief エンコード・送信ループを実行する
+ * @brief Encode/send loop, run while in STREAMING.
  *
- * STREAMING ステート中に呼び出す。フレームを取得してエンコードし、
- * 全 RTSP クライアントに送信する。
- *
- * DXGI Desktop Duplication は画面に変化がない場合フレームを送らないため、
- * 最後に受信したフレームを設定 fps に合わせて繰り返し送信する（フリーズフレーム）。
- * DXGI ハードエラー（ACCESS_LOST 等）を検出した場合は即座に RECONFIGURING に遷移する。
+ * Desktop Duplication delivers no frame while the screen is static, so the
+ * last received frame is re-sent at the configured fps (freeze frame).
+ * Exits on stop, RTSP send error (-> RECONNECTING), encode failure (-> FATAL),
+ * a pending resize or a DXGI hard error such as ACCESS_LOST (-> RECONFIGURING).
  */
 void ScreenPipeline::do_streaming_loop() {
     time_utils::Stopwatch metrics_sw;
     uint64_t bytes_since_last  = 0;
     uint64_t frames_since_last = 0;
 
-    // 静止画面でのフリーズフレーム繰り返し用キャッシュ。
-    // do_init_and_capture() が保存した初期フレームを起点とすることで、
-    // DXGI が次のフレームを返すまでの間（アイドルモニターでは 24 秒以上）
-    // ストリームが真っ暗になる問題を防ぐ。
+    // Cache of the last frame, re-sent on a static screen. Seeded with the saved
+    // initial frame because on an idle monitor DXGI can take a very long time to
+    // return the next frame, which would leave the stream black.
     FrameBuffer freeze_buf  = std::move(initial_frame_buf_);
     FrameMeta   freeze_meta = initial_frame_meta_;
     bool        has_freeze  = (!freeze_buf.data.empty() || freeze_buf.gpu_texture != nullptr);
-    // 使用したら解放してメモリを節約する（高解像度フレームは数十 MB になる）
     initial_frame_meta_ = {};
 
-    // 直前に encode() したフレームからピクセル内容が変化しているか。
-    // DXGI Desktop Duplication は画面に変化があった場合のみ新規フレームを
-    // 返すため、新規フレームを受信した時点で true にする。フリーズフレーム
-    // （新規フレームなし）の再送時は内容が同一なので false のまま encode() に
-    // 渡し、sws_scale による色空間変換コストを省略させる。
+    // Whether the pixels differ from the previously encoded frame. Set when a new
+    // frame arrives; a re-sent freeze frame keeps it false so encode() can skip
+    // the sws_scale colour conversion.
     bool content_changed = true;
 
-    // 設定 fps に基づくフレーム送信間隔 (μs)
     const int64_t frame_interval_us = 1000000LL / config_.encoder.fps;
-    time_utils::Stopwatch frame_sw;  // フレーム送信タイマー
+    time_utils::Stopwatch frame_sw;  // time since the last frame was sent
 
     while (!stop_requested_.load() &&
            state_machine_.current_state() == PipelineState::STREAMING) {
 
-        // DXGI ハードエラー（ACCESS_LOST 等）を検出したら即座に再初期化する
-        // タイムアウト（画面変化なし）とは区別し、静止画面では RECONFIGURING に遷移しない
+        // A hard error (e.g. ACCESS_LOST) triggers an immediate re-init. A mere
+        // timeout (static screen) is not an error, so it never causes RECONFIGURING.
         if (frame_pump_->has_backend_error()) {
             log_->log_error("DXGI_HARD_ERROR",
                             "DXGI hard error detected for monitor "
@@ -343,16 +317,15 @@ void ScreenPipeline::do_streaming_loop() {
             return;
         }
 
-        // 音声パケットを送信する。音声はキャプチャ間隔が映像と異なるため
-        // 毎ループ先に排出するが、1 回のループで排出するパケット数には上限を
-        // 設ける。av_interleaved_write_frame は同期的なネットワーク呼び出しの
-        // ため、無制限に排出すると滞留時に映像フレームの送信間隔を乱してしまう。
+        // Drain audio packets every iteration, capped per iteration:
+        // av_interleaved_write_frame is a synchronous network call, so an
+        // unbounded drain of a backlog would disturb video frame pacing.
         if (audio_queue_) {
             EncodedPacket apkt;
             constexpr int kMaxAudioPacketsPerLoop = 16;
             for (int i = 0; i < kMaxAudioPacketsPerLoop && audio_queue_->try_pop(apkt); ++i) {
-                // capture_timestamp_us（絶対キャプチャ時刻）を、この RTSP 接続の
-                // NTP 基点 (audio_stream_start_us_) からの相対サンプル数に変換する。
+                // Convert the absolute capture time to samples since this
+                // connection's NTP base (audio_stream_start_us_); keep pts strictly increasing.
                 int64_t rel_us = apkt.capture_timestamp_us - audio_stream_start_us_;
                 if (rel_us < 0) rel_us = 0;
                 int64_t pts = (rel_us * apkt.time_base_den) / 1000000LL;
@@ -373,7 +346,7 @@ void ScreenPipeline::do_streaming_loop() {
             }
         }
 
-        // 次のフレーム送信時刻までの残り待機時間を計算する
+        // Wait at most until the next frame is due
         int64_t wait_us = frame_interval_us - frame_sw.elapsed_us();
         int     wait_ms = (wait_us > 0)
                           ? std::min(static_cast<int>(wait_us / 1000) + 1,
@@ -387,7 +360,6 @@ void ScreenPipeline::do_streaming_loop() {
                          : frame_pump_->try_pop(buf, meta);
 
         if (got_frame) {
-            // 新しいフレームを受信: フリーズバッファを更新する
             freeze_buf       = std::move(buf);
             freeze_meta      = meta;
             has_freeze       = true;
@@ -395,24 +367,21 @@ void ScreenPipeline::do_streaming_loop() {
             metrics_->increment_frames_received(monitor_info_.number);
         }
 
-        // 送信間隔に達していなければスキップする（新規フレームも同様）
-        // これにより画面更新が速い場合でも設定 fps を超えて送信しない
+        // Not yet due (new frames too): never send faster than the configured fps
         if (frame_sw.elapsed_us() < frame_interval_us) {
             continue;
         }
 
-        // フリーズフレームがなければ最初のフレームがまだ来ていない
+        // No frame received yet
         if (!has_freeze) {
             continue;
         }
 
-        // 送信タイムスタンプを現在時刻に統一する（フリーズフレーム・新規フレーム共通）
+        // Stamp every sent frame (new or freeze) with the current wall-clock time
         freeze_meta.timestamp_us = time_utils::system_now_us();
 
-        // フレーム送信タイマーをリセットする
         frame_sw.reset();
 
-        // 解像度変更通知が来ていれば RECONFIGURING に遷移する
         if (resize_pending_.load()) {
             if (!state_machine_.transition_to(PipelineState::RECONFIGURING)) {
                 log_->log_error("STATE_TRANSITION_FAILED",
@@ -421,8 +390,6 @@ void ScreenPipeline::do_streaming_loop() {
             break;
         }
 
-        // エンコードする。content_changed が false の場合、エンコーダー側で
-        // sws_scale をスキップして直前の変換結果を再利用する（CPU 負荷削減）
         std::vector<EncodedPacket> packets;
         if (!encoder_->encode(freeze_buf, freeze_meta, packets, content_changed)) {
             log_->log_error("ENCODER_ENCODE_FAILED",
@@ -435,11 +402,9 @@ void ScreenPipeline::do_streaming_loop() {
             }
             break;
         }
-        // 変換済み YUV フレームは消費されたので、次に新規フレームを受信するまでは
-        // 内容が変化していない（再変換不要）
+        // Unchanged until the next new frame arrives
         content_changed = false;
 
-        // 全 RTSP クライアントにパケットを送信する
         bool rtsp_error = false;
         for (auto& pkt : packets) {
             for (auto& client : rtsp_clients_) {
@@ -468,7 +433,7 @@ void ScreenPipeline::do_streaming_loop() {
             frames_since_last++;
             for (const auto& pkt : packets) bytes_since_last += pkt.data.size();
 
-            // 1 秒ごとに FPS とビットレートのメトリクスを更新する
+            // Update fps/bitrate metrics about once per second
             int64_t elapsed_ms = metrics_sw.elapsed_ms();
             if (elapsed_ms >= 1000) {
                 double fps  = frames_since_last * 1000.0 / elapsed_ms;
@@ -482,14 +447,11 @@ void ScreenPipeline::do_streaming_loop() {
         }
     }
 
-    // RECONNECT (STREAMING → RECONNECTING → STREAMING) 後に再び do_streaming_loop() が
-    // 呼ばれると initial_frame_buf_ は空（最初の呼び出しで std::move 済み）のため、
-    // GPU ゼロコピーモード中に静止画面のモニターでは DXGI が新規フレームを
-    // 返さず has_freeze = false のままストリームが真っ暗になる。
-    // ループ終了時に最後のフリーズフレームを保存しておくことで次回呼び出し時に
-    // 即座に送信できる状態にする。
-    // ※ GPU テクスチャを含む場合は do_reconfigure() でクリアすること
-    //    （D3D11 デバイス解放後に古いテクスチャを参照し続けるのを防ぐため）。
+    // Save the last freeze frame for the next call. After RECONNECTING ->
+    // STREAMING, initial_frame_buf_ would be empty (moved out above) and a static
+    // monitor in zero-copy mode would stay black until DXGI returns a new frame.
+    // A saved GPU texture must be cleared in do_reconfigure()/teardown_all()
+    // before the D3D11 device is released.
     if (has_freeze) {
         initial_frame_buf_  = std::move(freeze_buf);
         initial_frame_meta_ = freeze_meta;
@@ -497,13 +459,12 @@ void ScreenPipeline::do_streaming_loop() {
 }
 
 /**
- * @brief RTSP 再接続をバックオフ付きで実行する
+ * @brief Reconnect all RTSP streams with exponential backoff (RECONNECTING -> STREAMING).
  *
- * 再接続に成功した場合は STREAMING に遷移する。
- * stop_requested_ が立った場合は STOPPING に遷移して終了する。
+ * Moves to STOPPING if stop_requested_ is set before reconnection succeeds.
  */
 void ScreenPipeline::do_reconnect() {
-    // 接続中のクライアントがあれば停止を1回だけ記録して解放する
+    // Log publish_stopped once for the group, not per client
     bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
                                      [](const auto& c) { return c->is_connected(); });
     if (was_connected) log_->log_publish_stopped(monitor_info_.number, "reconnecting");
@@ -520,12 +481,10 @@ void ScreenPipeline::do_reconnect() {
 
         if (stop_requested_.load()) break;
 
-        // 全 URL に再接続を試みる
         auto urls = make_rtsp_urls();
         auto codec_info = encoder_->get_codec_info();
-        // 再接続時は最初のフレームの時刻を RTCP SR の NTP 基点として渡す。
-        // これにより接続時の av_gettime() ではなく実際のストリーム開始時刻が使われ、
-        // VLC が受信するパケットのタイムスタンプが現在時刻より大幅にずれるのを防ぐ。
+        // Use the first frame's time as the RTCP SR NTP base (not the reconnect
+        // time) so receivers such as VLC do not see timestamps far from the encoder's.
         codec_info.stream_start_us = encoder_->first_frame_time_us();
 
         bool has_audio = (audio_pipeline_ && audio_pipeline_->is_running());
@@ -563,15 +522,14 @@ void ScreenPipeline::do_reconnect() {
                 log_->log_error("STATE_TRANSITION_FAILED",
                                 "Cannot transition to STREAMING after reconnect");
             }
-            // 再接続直後の最初のフレームを IDR として送出する。
-            // エンコーダーをリセットせず GOP 内に挿入するため PTS の連続性は保たれる。
-            // これにより接続直後から受信側が黒画面なく映像を表示できる。
+            // Make the first frame after reconnecting an IDR so receivers can
+            // start decoding immediately. The encoder is not reset, so PTS stays continuous.
             encoder_->request_next_idr();
             return;
         }
     }
 
-    // 停止リクエストが来た場合
+    // Only reached when stop was requested
     if (!state_machine_.transition_to(PipelineState::STOPPING)) {
         log_->log_error("STATE_TRANSITION_FAILED",
                         "Cannot transition to STOPPING from RECONNECTING");
@@ -579,31 +537,26 @@ void ScreenPipeline::do_reconnect() {
 }
 
 /**
- * @brief 解像度変更に対応して再初期化する
+ * @brief Handle a resolution change or DXGI hard error (RECONFIGURING -> CAPTURING).
  *
- * FramePump を停止し、DXGI バックエンドを再構成する。
- * エンコーダーと RTSP クライアントを解放して CAPTURING に遷移し、
- * pipeline_thread_func の CAPTURING ケースで再接続させる。
+ * Stops the FramePump, releases the encoder and RTSP clients, re-inits the DXGI
+ * backend at the new size and returns to CAPTURING; do_connect() then
+ * runs from pipeline_thread_func(). A failed DXGI re-init goes to FATAL.
  */
 void ScreenPipeline::do_reconfigure() {
-    // フレームポンプを一時停止する
     if (frame_pump_) frame_pump_->stop();
 
-    // D3D11 デバイス解放前に GPU テクスチャ参照を含む初期フレームバッファを
-    // クリアする。do_streaming_loop() 終了時に保存された freeze_buf が
-    // GPU テクスチャを持つ場合、ここでクリアしないと capture_backend_->release()
-    // 後も古いデバイスのテクスチャが参照され続けることになる。
+    // Drop any saved frame holding a GPU texture before the backend (and its
+    // D3D11 device) is released, so no texture of the old device outlives it.
     initial_frame_buf_  = FrameBuffer{};
     initial_frame_meta_ = {};
 
-    // 接続中のクライアントがあれば停止を1回だけ記録して解放する
     bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
                                      [](const auto& c) { return c->is_connected(); });
     if (was_connected) log_->log_publish_stopped(monitor_info_.number, "reconfiguring");
     for (auto& client : rtsp_clients_) client->disconnect();
     rtsp_clients_.clear();
 
-    // エンコーダーをフラッシュして解放する
     if (encoder_) {
         std::vector<EncodedPacket> flush_pkts;
         encoder_->flush(flush_pkts);
@@ -611,7 +564,7 @@ void ScreenPipeline::do_reconfigure() {
         encoder_.reset();
     }
 
-    // 解像度変更フラグをアトミックに取得してクリアし、保護下でサイズを読み取る
+    // Consume the resize flag atomically, then read the size under the mutex
     bool had_resize = resize_pending_.exchange(false);
     PendingResize pending;
     if (had_resize) {
@@ -621,13 +574,8 @@ void ScreenPipeline::do_reconfigure() {
     int new_w = had_resize ? pending.width  : current_width_;
     int new_h = had_resize ? pending.height : current_height_;
 
-    // DXGI バックエンドを完全に再初期化する (ACCESS_LOST 後の回復を含む)
-    //
-    // 解像度変更直後は Windows のディスプレイドライバーが構成を更新中であり、
-    // DuplicateOutput が E_ACCESSDENIED (0x80070005) を返すことがある。
-    // 同じ GPU を共有する全モニターが同時に RECONFIGURING に入る場合も同様。
-    // 致命的エラーと判断する前に init_capture_with_retry() で最大 15 回リトライする
-    // (最大待機 3s。通常 1～2 回目のリトライで成功する)。
+    // Full DXGI re-init (also recovers from ACCESS_LOST); retried before being
+    // treated as fatal, see init_capture_with_retry().
     if (capture_backend_) {
         capture_backend_->release();
 
@@ -648,12 +596,10 @@ void ScreenPipeline::do_reconfigure() {
     current_height_ = new_h;
     metrics_->set_resolution(monitor_info_.number, current_width_, current_height_);
 
-    // FramePump を再開して最初のフレームを待つ。
-    // DXGI は新規の DuplicateOutput 直後の最初の AcquireNextFrame で
-    // 必ず現在のデスクトップフレームを返す（画面変化がなくても）。
-    // これを初期フリーズフレームとして保存することで do_streaming_loop() の
-    // 起動直後から映像が届くようにする（アイドルモニターで最大 24 秒かかる
-    // GPU ゼロコピーモード下での次フレーム到着を待たずに済む）。
+    // Restart the FramePump and seed the initial freeze frame: the first
+    // AcquireNextFrame after a fresh DuplicateOutput returns the current desktop
+    // even if nothing changed, so video flows immediately instead of waiting for
+    // the next frame (which can take a long time on an idle monitor).
     if (frame_pump_ && capture_backend_) {
         frame_pump_->start(capture_backend_.get(), config_.capture.frame_timeout_ms);
 
@@ -665,7 +611,6 @@ void ScreenPipeline::do_reconfigure() {
         }
     }
 
-    // CAPTURING に戻す。次のループで do_connect() が呼ばれる
     if (!state_machine_.transition_to(PipelineState::CAPTURING)) {
         log_->log_error("STATE_TRANSITION_FAILED",
                         "Cannot transition to CAPTURING after reconfigure");
@@ -676,16 +621,12 @@ void ScreenPipeline::do_reconfigure() {
     }
 }
 
-/**
- * @brief すべてのパイプラインリソースを解放する
- */
+/** @brief Release all pipeline resources (frame pump, RTSP clients, encoder, capture backend), in that order. */
 void ScreenPipeline::teardown_all() {
-    // GPU テクスチャを含む初期フレームバッファを D3D11 デバイス解放前にクリアする。
-    // 通常フローでは do_reconfigure() がクリア済みだが、stop_requested_ が
-    // RECONFIGURING ステート中に立った場合、do_reconfigure() の実行前に
-    // pipeline_thread_func が停止条件を満たして teardown_all() を呼ぶことがある。
-    // そのまま capture_backend_->release() を呼ぶと、古い D3D11 デバイスへの
-    // GPU テクスチャ参照が残り use-after-free になるため、ここで確実にクリアする。
+    // Clear any saved GPU-texture frame before the D3D11 device is released.
+    // do_reconfigure() normally does this, but if stop is requested while in
+    // RECONFIGURING, pipeline_thread_func() can reach teardown_all() first;
+    // releasing the backend with the texture still held would be a use-after-free.
     initial_frame_buf_  = FrameBuffer{};
     initial_frame_meta_ = {};
 
@@ -694,7 +635,6 @@ void ScreenPipeline::teardown_all() {
         frame_pump_.reset();
     }
 
-    // 接続中のクライアントがあれば停止を1回だけ記録して解放する
     bool was_connected = std::any_of(rtsp_clients_.begin(), rtsp_clients_.end(),
                                      [](const auto& c) { return c->is_connected(); });
     if (was_connected) log_->log_publish_stopped(monitor_info_.number, "teardown");
@@ -714,21 +654,15 @@ void ScreenPipeline::teardown_all() {
     }
 }
 
-/**
- * @brief パイプラインスレッドのメイン関数
- *
- * INIT からスタートし、ステートマシンに従って各フェーズを実行する。
- */
+/** @brief Pipeline thread body: init, then dispatch on the current state until stop, FATAL or STOPPING. */
 void ScreenPipeline::pipeline_thread_func() {
-    // INIT → CAPTURING へ初期化する
     if (!do_init_and_capture()) return;
 
     while (!stop_requested_.load()) {
         switch (state_machine_.current_state()) {
             case PipelineState::CAPTURING:
-                // エンコーダーと RTSP クライアントを接続する
                 if (!do_connect()) {
-                    // RTSP 接続失敗。少し待ってから CAPTURING ステートで再試行する
+                    // Wait, then retry from CAPTURING
                     std::this_thread::sleep_for(std::chrono::milliseconds(
                         config_.rtsp.reconnect_delay_ms));
                 }
@@ -782,7 +716,6 @@ MonitorSupervisor::~MonitorSupervisor() {
 bool MonitorSupervisor::init(const AppConfig& config, std::string& error) {
     config_ = config;
 
-    // ログシンクを初期化する
     log_ = std::make_shared<LogSink>();
     if (!log_->init(config_.app.log_dir,
                     config_.app.instance_name,
@@ -793,8 +726,7 @@ bool MonitorSupervisor::init(const AppConfig& config, std::string& error) {
 
     metrics_ = std::make_shared<MetricsStore>();
 
-    // 音声配信が有効な場合は共有音声パイプラインを起動する。
-    // 初期化に失敗しても音声なしで映像配信は継続できるよう、エラーはログのみに留める。
+    // Audio failure is only logged: video streaming continues without audio.
     if (config_.audio.enabled) {
         auto audio_pipeline = std::make_shared<AudioPipeline>();
         std::string audio_err;
@@ -816,30 +748,27 @@ void MonitorSupervisor::request_stop() {
 }
 
 /**
- * @brief 現在のモニター一覧と前回の一覧を比較して差分を適用する
+ * @brief Diff the current monitor list against the previous one and apply the changes.
  *
- * パイプライン管理には物理モニター単位で安定な `stable_id` をキーとして使用する。
- * これにより、Windows がモニター番号を再パックしてもパイプラインと物理モニターの
- * 対応が崩れない。
+ * Pipelines are keyed by `stable_id` (stable per physical monitor), so the
+ * mapping survives Windows renumbering monitors.
  *
- * 以下の 4 ケースを処理する:
- * - **削除**: stable_id が現行に無ければパイプラインを停止・破棄する。
- * - **追加**: 現行の stable_id がマップに無ければ新規パイプラインを生成・起動する。
- * - **FATAL 再起動**: 既存パイプラインが FATAL ならば停止・再生成する。
- * - **再ターゲット**: number / is_primary / handle が変化した場合（プライマリ昇格や
- *   番号再割り当てなど）、パイプラインを stop → 再生成することで /screen0 の
- *   プライマリ追従と screenN の Settings 番号追従を保証する。
- * - **解像度のみ変化**: 上記と独立に notify_resized() で軽量対処する。
+ * Cases handled:
+ * - Removed: stable_id absent from the current list -> stop and destroy the pipeline.
+ * - Added: stable_id not in the map -> create and start a pipeline.
+ * - FATAL: existing pipeline is FATAL -> stop and recreate it.
+ * - Retarget: number / is_primary / handle changed (e.g. primary promotion or
+ *   renumbering) -> recreate the pipeline so the primary alias and the
+ *   Settings-based screen number follow the monitor.
+ * - Resolution only: notify_resized() on the existing pipeline.
  */
 void MonitorSupervisor::apply_monitor_changes(
         const std::vector<MonitorInfo>& current) {
     std::lock_guard<std::mutex> lk(pipelines_mutex_);
 
-    // stable_id のセットを構築する
     std::set<std::string> current_ids;
     for (const auto& m : current) current_ids.insert(m.stable_id);
 
-    // 削除されたモニターのパイプラインを停止する
     for (const auto& mi : last_monitors_) {
         if (current_ids.find(mi.stable_id) == current_ids.end()) {
             log_->log_monitor_removed(mi.number);
@@ -851,14 +780,11 @@ void MonitorSupervisor::apply_monitor_changes(
         }
     }
 
-    // 追加・FATAL・再ターゲットのパイプラインを処理する
     for (const auto& mi : current) {
         auto it          = pipelines_.find(mi.stable_id);
         const bool is_new   = (it == pipelines_.end());
         const bool is_fatal = (!is_new && it->second->is_fatal());
 
-        // 再ターゲット判定: 同一物理モニターで number / is_primary / handle が変化した場合
-        // → /screen0 のプライマリ追従・screenN の Settings 番号追従のためにパイプラインを再生成する
         bool needs_retarget = false;
         if (!is_new && !is_fatal) {
             const auto& p = it->second;
@@ -896,7 +822,7 @@ void MonitorSupervisor::apply_monitor_changes(
         }
     }
 
-    // 解像度が変更されたモニターに通知する（再ターゲット不要なもののみ）
+    // Notify resolution changes (only for monitors that were not retargeted)
     for (const auto& mi : current) {
         for (const auto& lm : last_monitors_) {
             if (mi.stable_id == lm.stable_id          &&
@@ -916,9 +842,7 @@ void MonitorSupervisor::apply_monitor_changes(
     last_monitors_ = current;
 }
 
-/**
- * @brief モニター変化ポーリングスレッドのメイン関数
- */
+/** @brief Poll MonitorDetector every monitor_check_interval_ms and apply the changes. */
 void MonitorSupervisor::monitor_poll_loop() {
     while (!stop_requested_.load()) {
         auto monitors = MonitorDetector::enumerate();
@@ -928,9 +852,7 @@ void MonitorSupervisor::monitor_poll_loop() {
     }
 }
 
-/**
- * @brief メトリクス書き込みスレッドのメイン関数
- */
+/** @brief Write metrics and health files periodically; one final write on stop. */
 void MonitorSupervisor::metrics_writer_loop() {
     time_utils::Stopwatch metrics_sw;
     time_utils::Stopwatch health_sw;
@@ -947,31 +869,26 @@ void MonitorSupervisor::metrics_writer_loop() {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // 最終フラッシュ
     metrics_->save_metrics(config_.app.metrics_path);
     metrics_->save_health(config_.app.health_path);
 }
 
 /**
- * @brief メインループを実行する
+ * @brief Start the background threads, block until stop is requested, then shut down gracefully.
  *
- * バックグラウンドスレッドを開始し、FATAL パイプラインの監視と
- * グレースフルシャットダウンを担当する。
+ * Monitor changes and FATAL pipeline restarts are handled by monitor_poll_loop().
  */
 void MonitorSupervisor::run() {
     metrics_->mark_session_start();
 
-    // バックグラウンドスレッドを開始する
     monitor_thread_ = std::thread(&MonitorSupervisor::monitor_poll_loop,  this);
     metrics_thread_ = std::thread(&MonitorSupervisor::metrics_writer_loop, this);
 
-    // メインループ: 停止リクエストを待つ
-    // FATAL パイプラインの再起動は monitor_poll_loop → apply_monitor_changes で処理する
     while (!stop_requested_.load()) {
         std::this_thread::sleep_for(std::chrono::milliseconds(100));
     }
 
-    // グレースフルシャットダウン: 全パイプラインを停止する
+    // Stop all pipelines
     {
         std::lock_guard<std::mutex> lk(pipelines_mutex_);
         for (auto& [sid, pipeline] : pipelines_) {
@@ -980,7 +897,7 @@ void MonitorSupervisor::run() {
         pipelines_.clear();
     }
 
-    // 全パイプラインが購読解除された後に音声パイプラインを停止する
+    // Stop audio only after every pipeline has unsubscribed
     if (audio_pipeline_) {
         audio_pipeline_->stop();
     }

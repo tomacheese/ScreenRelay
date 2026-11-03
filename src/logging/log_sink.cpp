@@ -19,26 +19,22 @@ bool LogSink::init(const std::string& log_dir,
                    const std::string& log_level,
                    std::string& error) {
     try {
-        // ログディレクトリを作成する
         fs::create_directories(log_dir);
 
         std::string log_path = log_dir + "/" + instance_name + ".jsonl";
 
-        // ローテーティングファイルシンク (最大 10 MB × 5 ファイル)
         auto file_sink = std::make_shared<spdlog::sinks::rotating_file_sink_mt>(
             log_path, 10 * 1024 * 1024 /* 10 MB */, 5 /* files */);
 
-        // コンソールシンク
         auto console_sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
 
         logger_ = std::make_shared<spdlog::logger>(
             instance_name,
             spdlog::sinks_init_list{file_sink, console_sink});
 
-        // JSON は手動で構築するためパターンはメッセージのみ
+        // JSON is built by build_json(), so the pattern is the bare message
         logger_->set_pattern("%v");
 
-        // ログレベルを文字列から spdlog::level に変換して設定する
         spdlog::level::level_enum level = spdlog::level::info;
         if      (log_level == "trace")    level = spdlog::level::trace;
         else if (log_level == "debug")    level = spdlog::level::debug;
@@ -46,10 +42,10 @@ bool LogSink::init(const std::string& log_dir,
         else if (log_level == "warn")     level = spdlog::level::warn;
         else if (log_level == "error")    level = spdlog::level::err;
         else if (log_level == "critical") level = spdlog::level::critical;
-        // 不明なレベルはデフォルトの info を使用する
+        // Unknown levels keep the info default
 
         logger_->set_level(level);
-        // info 以上のメッセージは即時フラッシュしてリアルタイムに tail -f で参照できるようにする
+        // Flush info and above immediately so `tail -f` shows them in real time
         logger_->flush_on(spdlog::level::info);
 
     } catch (const std::exception& e) {
@@ -60,11 +56,7 @@ bool LogSink::init(const std::string& log_dir,
     return true;
 }
 
-/**
- * @brief JSON の文字列値をエスケープする
- * @param s エスケープ対象の文字列
- * @return エスケープ済み文字列
- */
+/** @brief Escape @p s for use inside a JSON string literal. */
 static std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -79,7 +71,7 @@ static std::string json_escape(const std::string& s) {
             case '\t': out += "\\t";  break;
             default:
                 if (c < 0x20) {
-                    // JSON 仕様に従い制御文字を \uXXXX でエスケープする
+                    // Remaining control characters must be \uXXXX per the JSON spec
                     char buf[7];
                     snprintf(buf, sizeof(buf), "\\u%04x", c);
                     out += buf;

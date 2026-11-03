@@ -1,17 +1,19 @@
-# メトリクス & ヘルス仕様
+# Metrics and Health Specification
 
-## 出力ファイル
+## Output files
 
-| ファイル | デフォルトパス | 更新間隔 |
+| File | Default path | Update interval |
 |---|---|---|
-| `health.json` | `./state/health.json` | `emit_metrics_interval_ms` ごと（デフォルト 1 秒） |
-| `metrics.json` | `./state/metrics.json` | `emit_metrics_interval_ms` ごと（デフォルト 1 秒） |
+| `health.json` | `./state/health.json` | Every `runtime.emit_metrics_interval_ms` (default 1 second) |
+| `metrics.json` | `./state/metrics.json` | Every `runtime.emit_metrics_interval_ms` (default 1 second) |
+
+Paths are set by `app.health_path` and `app.metrics_path` (see [configuration.md](configuration.md)). Both files are pretty-printed with 2-space indentation and are replaced atomically (written to `<path>.tmp`, then renamed over the old file), so readers never see a partial file. They are also written one final time at shutdown. If a write fails, `[ERROR] Failed to write ...` is printed to stderr and the previous file is kept.
 
 ---
 
 ## health.json
 
-### フォーマット
+### Format
 
 ```json
 {
@@ -25,25 +27,25 @@
 }
 ```
 
-### フィールド説明
+### Fields
 
-| フィールド | 型 | 説明 |
+| Field | Type | Description |
 |---|---|---|
-| `healthy` | boolean | すべてのモニターが正常なとき `true` |
-| `monitors` | object | モニター番号をキーとした各モニターのヘルス情報 |
-| `monitors[n].healthy` | boolean | そのモニターが正常なとき `true` |
-| `monitors[n].state` | string | そのモニターの現在の状態（ステートマシンの状態名） |
-| `ts` | string | 書き出し時刻（ISO 8601 UTC） |
+| `healthy` | boolean | `true` when every monitor is healthy |
+| `monitors` | object | Per-monitor health, keyed by monitor number |
+| `monitors[n].healthy` | boolean | `true` when that monitor is healthy |
+| `monitors[n].state` | string | Current state-machine state name of that monitor (see [state-machine.md](state-machine.md)) |
+| `ts` | string | Time of writing (ISO 8601, UTC) |
 
-### `healthy` の判定ロジック
+### How `healthy` is determined
 
-トップレベルの `healthy` は、**すべてのモニターが `STREAMING` または `CONNECTING` 状態のとき `true`** になります。1 台でも `FATAL` や長時間 `RECONNECTING` 状態のモニターがある場合は `false` になります。
+A monitor is healthy only while its state is `STREAMING` or `CONNECTING`. Every other state (`INIT`, `CAPTURING`, `RECONNECTING`, `RECONFIGURING`, `STOPPING`, `FATAL`) counts as unhealthy immediately; there is no grace period. The top-level `healthy` is `true` only if at least one monitor is known and all known monitors are healthy, so it is `false` before the first monitor has registered.
 
 ---
 
 ## metrics.json
 
-### フォーマット
+### Format
 
 ```json
 {
@@ -67,41 +69,43 @@
 }
 ```
 
-### トップレベルフィールド
+### Top-level fields
 
-| フィールド | 型 | 説明 |
+| Field | Type | Description |
 |---|---|---|
-| `ts` | string | 書き出し時刻（ISO 8601 UTC） |
-| `uptime_ms` | integer | アプリケーション起動からの経過時間（ミリ秒） |
-| `monitors` | object | モニター番号をキーとした各モニターのメトリクス |
+| `ts` | string | Time of writing (ISO 8601, UTC) |
+| `uptime_ms` | integer | Milliseconds since the supervisor started running |
+| `monitors` | object | Per-monitor metrics, keyed by monitor number |
 
-### モニターごとのフィールド
+### Per-monitor fields
 
-| フィールド | 型 | 説明 |
+| Field | Type | Description |
 |---|---|---|
-| `state` | string | 現在の状態名 |
-| `width` | integer | キャプチャ解像度（幅、ピクセル） |
-| `height` | integer | キャプチャ解像度（高さ、ピクセル） |
-| `fps` | float | 設定されたフレームレート |
-| `bitrate_kbps` | float | 設定されたビットレート（kbps） |
-| `codec` | string | 実際に使用中のコーデック名 |
-| `frames_received` | integer | キャプチャバックエンドから受信したフレーム総数 |
-| `frames_encoded` | integer | エンコードに成功したフレーム総数 |
-| `frames_dropped` | integer | キューが満杯のためドロップしたフレーム総数 |
-| `rtsp_errors` | integer | RTSP 送信エラーの累計回数 |
-| `reconnect_attempts` | integer | RTSP 再接続を試みた累計回数 |
+| `state` | string | Current state name |
+| `width` | integer | Capture resolution, width in pixels |
+| `height` | integer | Capture resolution, height in pixels |
+| `fps` | float | Measured encoded frame rate, recomputed about once per second while streaming. `0.0` until the first measurement |
+| `bitrate_kbps` | float | Measured output bitrate (kbps), recomputed about once per second while streaming. `0.0` until the first measurement |
+| `codec` | string | Codec actually in use |
+| `frames_received` | integer | Total frames received from the capture backend |
+| `frames_encoded` | integer | Total frames successfully encoded |
+| `frames_dropped` | integer | Total frames lost to encode failures |
+| `rtsp_errors` | integer | Total RTSP send errors |
+| `reconnect_attempts` | integer | Total RTSP reconnect attempts |
+
+Counters are cumulative since process start and are keyed by monitor number. Entries are never removed, so a monitor that has been unplugged keeps its last values (including its last state) in both files.
 
 ---
 
-## イベントログ（JSON Lines）
+## Event log (JSON Lines)
 
-ログファイルは `log_dir` に `<instance_name>.jsonl` として JSON Lines 形式で出力されます。各行が 1 件のイベントです。
+Log events are written to `<log_dir>/<instance_name>.jsonl` (rotated at 10 MB, 5 files kept) and are also echoed to the console. Each line is one event. Messages at `info` or above are flushed immediately, so `tail -f` shows them in real time.
 
-フィールドはすべて文字列値として出力されます（数値・boolean を含む）。
+Every field value, including numbers and booleans, is written as a string. Fields other than `ts` and `event` appear in alphabetical key order. Event and error lines are filtered by `app.log_level` like any other log line; events marked `info` are therefore hidden at `warn` or above.
 
 ### state_changed
 
-ステートマシンの状態が変化したときに記録されます。
+Logged when a monitor's state machine changes state.
 
 ```json
 {"ts":"2026-04-30T19:21:03.000Z","event":"state_changed","from":"CONNECTING","monitor":"1","to":"STREAMING"}
@@ -109,7 +113,7 @@
 
 ### monitor_added
 
-新しいモニターが検出されたときに記録されます。
+Logged when a new monitor is detected.
 
 ```json
 {"ts":"2026-04-30T19:21:00.000Z","event":"monitor_added","device":"\\\\.\\DISPLAY2","height":"1024","is_primary":"false","monitor":"2","width":"1280"}
@@ -117,31 +121,63 @@
 
 ### monitor_removed
 
-モニターが取り外されたときに記録されます。
+Logged when a monitor is removed.
 
 ```json
 {"ts":"2026-04-30T19:25:00.000Z","event":"monitor_removed","monitor":"2"}
 ```
 
+### pipeline_restart / pipeline_retarget
+
+`pipeline_restart` (level `warn`) is logged when a pipeline in the `FATAL` state is stopped and recreated. `pipeline_retarget` (level `info`) is logged when a monitor's number, primary flag or handle changed and its pipeline is recreated so that `/screenN` and the `/screen0` alias follow the change. Both carry `monitor`, `stable_id` and `reason`.
+
+```json
+{"ts":"2026-04-30T19:26:00.000Z","event":"pipeline_restart","monitor":"1","reason":"FATAL pipeline restarting","stable_id":"..."}
+```
+
 ### encoder_initialized
 
-エンコーダーが初期化されたときに記録されます。`codec` には実際に選択されたコーデック名が入ります（フォールバックが発生した場合は設定値と異なる場合があります）。
+Logged when an encoder is initialized. `codec` is the codec actually selected, which differs from the configured `encoder.codec` when a fallback was used.
 
 ```json
 {"ts":"2026-04-30T19:21:01.000Z","event":"encoder_initialized","bitrate_kbps":"5000","codec":"h264_mf","fps":"60","height":"1080","monitor":"1","width":"1920"}
 ```
 
+### gpu_zero_copy_mode
+
+Logged right after the encoder is initialized, with `monitor` and `active` (`"true"` when the GPU zero-copy capture-to-encoder path is in use, `"false"` for the CPU path).
+
+```json
+{"ts":"2026-04-30T19:21:01.000Z","event":"gpu_zero_copy_mode","active":"true","monitor":"1"}
+```
+
 ### publish_started
 
-RTSP 配信が開始されたときに記録されます。
+Logged when RTSP publishing starts (also after a successful reconnect). One event is logged per published URL, so the primary monitor logs a second one for the `/screen0` alias.
 
 ```json
 {"ts":"2026-04-30T19:21:02.000Z","event":"publish_started","fps":"60","height":"1080","monitor":"1","url":"rtsp://192.168.0.100:8554/screen1","width":"1920"}
 ```
 
+### publish_stopped
+
+Logged when publishing stops. `reason` is a free-form string, e.g. `reconnecting` when the connection is dropped for a reconnect.
+
+```json
+{"ts":"2026-04-30T19:30:01.000Z","event":"publish_stopped","monitor":"1","reason":"reconnecting"}
+```
+
+### reconnecting
+
+Logged (level `warn`) before each RTSP reconnect attempt, with the attempt number and the delay about to be waited.
+
+```json
+{"ts":"2026-04-30T19:30:02.000Z","event":"reconnecting","attempt":"1","delay_ms":"1000","monitor":"1"}
+```
+
 ### audio_pipeline_started
 
-共有音声パイプラインの起動に成功したときに記録されます。
+Logged when the shared audio pipeline starts successfully.
 
 ```json
 {"ts":"2026-04-30T19:20:59.000Z","event":"audio_pipeline_started"}
@@ -149,41 +185,56 @@ RTSP 配信が開始されたときに記録されます。
 
 ### audio_encode_recovered
 
-音声エンコードが失敗状態から復帰したときに記録されます（連続失敗中は最初の 1 回のみ `AUDIO_ENCODE_FAILED` エラーが記録され、復帰時にこのイベントが 1 回だけ記録されます）。
+Logged when audio encoding recovers from a failing state. During consecutive failures only the first one is logged as an `AUDIO_ENCODE_FAILED` error; this event is logged once when encoding succeeds again.
 
 ```json
 {"ts":"2026-04-30T19:31:00.000Z","event":"audio_encode_recovered"}
 ```
 
-### error
+### supervisor_stopped
 
-エラーが発生したときに記録されます。
+Logged once at the end of shutdown, after the grace period.
 
 ```json
-{"ts":"2026-04-30T19:30:00.000Z","event":"error","code":"RTSP_SEND_FAILED","message":"av_interleaved_write_frame failed: Broken pipe","monitor":"1","url":"rtsp://..."}
+{"ts":"2026-04-30T19:40:00.000Z","event":"supervisor_stopped"}
+```
+
+### error
+
+Logged (level `err`) when an error occurs. `code` and `message` are always present; other fields (typically `monitor` and `url`) depend on the error.
+
+```json
+{"ts":"2026-04-30T19:30:00.000Z","event":"error","code":"RTSP_SEND_FAILED","message":"send_packet failed for monitor 1","monitor":"1","url":"rtsp://..."}
 ```
 
 ---
 
-## エラーコード一覧
+## Error codes
 
-| コード | 説明 |
+Values of the `code` field of `error` events.
+
+| Code | Description |
 |---|---|
-| `DXGI_INIT_FAILED` | DXGI Desktop Duplication 初期化失敗 |
-| `ENCODER_INIT_FAILED` | エンコーダー初期化失敗（全コーデック試行後） |
-| `ENCODER_ENCODE_FAILED` | エンコード中のエラー |
-| `RTSP_CONNECT_FAILED` | RTSP サーバーへの接続失敗 |
-| `RTSP_SEND_FAILED` | RTP パケット送信エラー |
-| `RTSP_TIMEOUT` | RTSP 送信タイムアウト |
-| `FATAL_ERROR` | 回復不能なエラー |
-| `AUDIO_INIT_FAILED` | 音声パイプライン初期化失敗（映像配信は継続） |
-| `AUDIO_ENCODE_FAILED` | 音声エンコード失敗（バッファを破棄して継続） |
+| `DXGI_INIT_FAILED` | DXGI Desktop Duplication initialization failed (pipeline goes to `FATAL`) |
+| `DXGI_HARD_ERROR` | DXGI hard error such as access lost while streaming (pipeline re-initializes capture via `RECONFIGURING`) |
+| `DXGI_REINIT_FAILED` | Capture re-initialization after a resolution change or hard error failed (pipeline goes to `FATAL`) |
+| `FIRST_FRAME_TIMEOUT` | No first frame arrived from the monitor (pipeline goes to `FATAL`) |
+| `ENCODER_INIT_FAILED` | Encoder initialization failed after trying all codecs (pipeline goes to `FATAL`) |
+| `ENCODER_ENCODE_FAILED` | Error while encoding (pipeline goes to `FATAL`; counted in `frames_dropped`) |
+| `RTSP_CONNECT_FAILED` | Initial connection to the RTSP server failed (pipeline returns to `CAPTURING` and retries) |
+| `RTSP_RECONNECT_FAILED` | A reconnect attempt failed (the backoff loop continues) |
+| `RTSP_SEND_FAILED` | Video or audio packet send error. A video send error counts in `rtsp_errors` and moves the pipeline to `RECONNECTING` |
+| `STATE_TRANSITION_FAILED` | A requested state transition was rejected by the state machine (internal consistency error) |
+| `AUDIO_INIT_FAILED` | Audio pipeline initialization failed (video publishing continues) |
+| `AUDIO_ENCODE_FAILED` | Audio encode failed; the buffer is discarded and processing continues |
+
+`src/common/errors.hpp` also defines `CAPTURE_INIT_FAILED`, `MONITOR_ENUM_FAILED`, `GPU_CRASH` and `RTSP_TIMEOUT`, but the application does not currently emit them.
 
 ---
 
-## 監視システムとの連携例
+## Integration with monitoring systems
 
-### Prometheus テキスト形式への変換スクリプト例
+### Example: convert to the Prometheus text format
 
 ```python
 import json
@@ -198,7 +249,7 @@ for monitor_id, mon in m["monitors"].items():
     print(f'screen_relay_rtsp_errors{{{labels}}} {mon["rtsp_errors"]}')
 ```
 
-### ヘルスチェックスクリプト例
+### Example: health check script
 
 ```bash
 #!/usr/bin/env bash

@@ -2,8 +2,7 @@
 #include <cstdio>
 #include <cstdlib>
 
-// NDEBUG に関係なく常に有効なユニットテスト用アサーション。
-// assert() とは異なりコンパイル時に無効化されない。
+// Test assertion that stays active under NDEBUG, unlike assert().
 #define VERIFY(cond) do { \
     if (!(cond)) { \
         std::fprintf(stderr, "[FAIL] VERIFY(%s) at %s:%d\n", \

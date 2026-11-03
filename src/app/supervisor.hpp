@@ -23,274 +23,185 @@
 #include <thread>
 #include <vector>
 
-// ─── ScreenPipeline ────────────────────────────────────────
-
 /**
- * @brief モニター 1 台分のキャプチャ→エンコード→RTSP 配信パイプライン
+ * @brief Capture -> encode -> RTSP pipeline for one monitor.
  *
- * 各モニターに対してひとつのインスタンスが生成される。
- * パイプラインスレッドが内部ステートマシンに従って各フェーズを実行する。
- * プライマリモニターの場合は 2 本の RTSP ストリーム (screen{n} と screen0) を配信する。
+ * One instance per monitor; its own thread runs the phases according to the
+ * internal StateMachine. The primary monitor publishes two RTSP streams
+ * (screen{n} and the screen0 alias) from the same encoder.
  */
 class ScreenPipeline {
 public:
     /**
-     * @brief コンストラクタ
-     * @param info     対象モニターの情報
-     * @param config   アプリケーション設定
-     * @param log      ログシンク
-     * @param metrics  メトリクスストア
+     * @param info           Target monitor
+     * @param config         Application settings (copied)
+     * @param log            Log sink
+     * @param metrics        Metrics store
+     * @param audio_pipeline Shared audio pipeline to subscribe to; nullptr = no audio
      */
     ScreenPipeline(const MonitorInfo& info, const AppConfig& config,
                    std::shared_ptr<LogSink> log,
                    std::shared_ptr<MetricsStore> metrics,
                    std::shared_ptr<AudioPipeline> audio_pipeline = nullptr);
 
-    /**
-     * @brief デストラクタ
-     *
-     * stop() を呼び出してパイプラインスレッドを終了する。
-     */
+    /** @brief Calls stop(), then unsubscribes from the audio pipeline. */
     ~ScreenPipeline();
 
-    /** @brief パイプラインを開始する */
+    /** @brief Start the pipeline thread. */
     void start();
 
-    /** @brief パイプラインを停止する */
+    /** @brief Request stop and join the pipeline thread (which releases all resources). */
     void stop();
 
     /**
-     * @brief 解像度変更を通知する
-     * @param new_width  新しい論理幅 (px)
-     * @param new_height 新しい論理高さ (px)
+     * @brief Notify a resolution change; the streaming loop then goes to RECONFIGURING.
+     * @param new_width  New logical width (px)
+     * @param new_height New logical height (px)
      */
     void notify_resized(int new_width, int new_height);
 
-    /**
-     * @brief 現在のステートを返す
-     * @return 現在の PipelineState
-     */
     PipelineState state() const { return state_machine_.current_state(); }
 
-    /**
-     * @brief モニター番号を返す
-     * @return モニター番号（Windows 設定ディスプレイ番号）
-     */
+    /** @brief Monitor number (the Windows Settings display number). */
     int monitor_number() const { return monitor_info_.number; }
 
-    /**
-     * @brief モニター番号を返す
-     * @return モニター番号（Windows 設定ディスプレイ番号）
-     */
+    /** @brief Same as monitor_number(). */
     int number() const { return monitor_info_.number; }
 
-    /**
-     * @brief プライマリモニターかどうかを返す
-     * @return プライマリモニターなら true
-     */
     bool is_primary() const { return monitor_info_.is_primary; }
 
-    /**
-     * @brief 物理モニターの安定 ID を返す
-     * @return stable_id（CCD monitorDevicePath、失敗時は device_name）
-     */
+    /** @brief Stable per-physical-monitor ID (CCD monitorDevicePath; device_name if unavailable). */
     const std::string& stable_id() const { return monitor_info_.stable_id; }
 
-    /**
-     * @brief モニターハンドルを返す
-     * @return HMONITOR
-     */
     HMONITOR handle() const { return monitor_info_.handle; }
 
-    /**
-     * @brief FATAL ステートかどうかを返す
-     * @return FATAL ステートなら true
-     */
     bool is_fatal() const { return state() == PipelineState::FATAL; }
 
 private:
-    /**
-     * @brief パイプラインスレッドのメイン関数
-     *
-     * ステートマシンに従って各フェーズを繰り返し実行する。
-     */
+
     void pipeline_thread_func();
 
-    /**
-     * @brief DXGI キャプチャと FramePump を初期化する (INIT → CAPTURING)
-     * @return 成功した場合 true
-     */
+    // INIT -> CAPTURING. Returns false (state FATAL) on failure.
     bool do_init_and_capture();
 
-    /**
-     * @brief エンコーダーと RTSP クライアントを初期化して接続する (CAPTURING → STREAMING)
-     * @return 成功した場合 true。失敗時は CAPTURING に留まる (リトライ可能)
-     */
+    // CAPTURING -> STREAMING. On RTSP connect failure returns false and stays in
+    // CAPTURING (retryable); encoder init failure is FATAL.
     bool do_connect();
 
-    /**
-     * @brief エンコード・送信ループを実行する (STREAMING 中)
-     *
-     * stop_requested_ または RTSP エラー・解像度変更が発生するまでループする。
-     */
+    // Runs until stop, an RTSP error, a resolution change or a DXGI hard error.
     void do_streaming_loop();
 
-    /**
-     * @brief RTSP 再接続をバックオフ付きで実行する (RECONNECTING → STREAMING)
-     */
+    // RECONNECTING -> STREAMING, retrying with backoff.
     void do_reconnect();
 
-    /**
-     * @brief 解像度変更に対応して再初期化する (RECONFIGURING → CAPTURING)
-     */
+    // RECONFIGURING -> CAPTURING (re-inits DXGI; the caller then reconnects).
     void do_reconfigure();
 
-    /**
-     * @brief すべてのパイプラインリソースを解放する
-     */
+    // Releases frame pump, RTSP clients, encoder and capture backend.
     void teardown_all();
 
-    /**
-     * @brief RTSP URL を生成する
-     *
-     * 通常は 1 本、プライマリモニターの場合は screen{n} と screen0 の 2 本を返す。
-     *
-     * @return RTSP URL のリスト
-     */
+    // One URL, or two (screen{n} and screen0) for the primary monitor.
     std::vector<std::string> make_rtsp_urls() const;
 
     /**
-     * @brief DXGI キャプチャバックエンドをリトライ付きで初期化する
-     *
-     * 解像度変更直後や GPU を共有する別モニターの RECONFIGURING と競合した場合、
-     * DuplicateOutput が E_ACCESSDENIED を返すことがある。200ms 間隔で最大 15 回
-     * リトライし、stop_requested_ が立てば途中で打ち切る。
-     *
-     * do_init_and_capture() と do_reconfigure() で重複していた
-     * リトライループをここに集約する。
-     *
-     * @param backend 初期化対象のバックエンド (null 不可)
-     * @param width   論理幅 (px)
-     * @param height  論理高さ (px)
-     * @return 初期化に成功した場合 true
+     * @brief Init @p backend with retries (see the definition for the policy).
+     * @param backend Backend to init (non-null)
+     * @param width   Logical width (px)
+     * @param height  Logical height (px)
+     * @return true on success
      */
     bool init_capture_with_retry(ICaptureBackend* backend, int width, int height);
 
-    MonitorInfo   monitor_info_;                ///< 対象モニター情報
-    AppConfig     config_;                      ///< アプリケーション設定
-    std::shared_ptr<LogSink>      log_;         ///< ログシンク
-    std::shared_ptr<MetricsStore> metrics_;     ///< メトリクスストア
+    MonitorInfo   monitor_info_;                ///< Target monitor
+    AppConfig     config_;                      ///< Application settings
+    std::shared_ptr<LogSink>      log_;         ///< Log sink
+    std::shared_ptr<MetricsStore> metrics_;     ///< Metrics store
 
-    std::unique_ptr<ICaptureBackend>              capture_backend_;  ///< キャプチャバックエンド
-    std::unique_ptr<FramePump>                    frame_pump_;       ///< フレームポンプ
-    std::unique_ptr<EncoderController>            encoder_;          ///< エンコーダー
-    std::vector<std::unique_ptr<RtspPublisherClient>> rtsp_clients_; ///< RTSP クライアントリスト
+    std::unique_ptr<ICaptureBackend>              capture_backend_;  ///< Capture backend
+    std::unique_ptr<FramePump>                    frame_pump_;       ///< Frame pump
+    std::unique_ptr<EncoderController>            encoder_;          ///< Encoder
+    std::vector<std::unique_ptr<RtspPublisherClient>> rtsp_clients_; ///< One client per RTSP URL
 
-    std::shared_ptr<AudioPipeline>         audio_pipeline_;  ///< 共有音声パイプライン (無効時は nullptr)
-    std::shared_ptr<AudioSubscriberQueue>  audio_queue_;     ///< 音声パケット購読キュー (無効時は nullptr)
-    int64_t audio_stream_start_us_ = 0;   ///< 音声 pts 再計算の基準時刻 (RTSP 接続開始時刻)
-    int64_t last_audio_pts_        = -1;  ///< 直近送信した音声 pts（単調増加保証用）
+    std::shared_ptr<AudioPipeline>         audio_pipeline_;  ///< Shared audio pipeline (nullptr if audio is off)
+    std::shared_ptr<AudioSubscriberQueue>  audio_queue_;     ///< This pipeline's audio subscription (nullptr if audio is off)
+    int64_t audio_stream_start_us_ = 0;   ///< Base time for audio pts recomputation (RTCP SR NTP base)
+    int64_t last_audio_pts_        = -1;  ///< Last audio pts sent (keeps pts strictly increasing)
 
-    StateMachine  state_machine_;              ///< パイプラインステートマシン
-    std::thread   pipeline_thread_;            ///< パイプラインスレッド
+    StateMachine  state_machine_;              ///< Pipeline state machine
+    std::thread   pipeline_thread_;            ///< Pipeline thread
 
-    std::atomic<bool> stop_requested_{false};  ///< 停止リクエストフラグ
-    std::atomic<bool> resize_pending_{false};  ///< 解像度変更ペンディングフラグ
+    std::atomic<bool> stop_requested_{false};  ///< Stop requested
+    std::atomic<bool> resize_pending_{false};  ///< Resolution change pending
 
     struct PendingResize {
         int width  = 0;
         int height = 0;
     };
-    mutable std::mutex resize_mutex_;   ///< pending_resize_ 保護用ミューテックス
-    PendingResize      pending_resize_; ///< 次の解像度 (resize_mutex_ 保護下で読み書き)
+    mutable std::mutex resize_mutex_;   ///< Guards pending_resize_
+    PendingResize      pending_resize_; ///< Next resolution (access under resize_mutex_)
 
-    BackoffState  rtsp_backoff_;               ///< RTSP 再接続バックオフ状態
-    int           current_width_  = 0;         ///< 現在のフレーム幅
-    int           current_height_ = 0;         ///< 現在のフレーム高さ
+    BackoffState  rtsp_backoff_;               ///< RTSP reconnect backoff
+    int           current_width_  = 0;         ///< Current frame width
+    int           current_height_ = 0;         ///< Current frame height
 
-    /// @brief do_init_and_capture() で取得した最初のフレーム。
-    ///        do_streaming_loop() の初期フリーズフレームとして使用し、
-    ///        DXGI が次のフレームを返すまでの間（アイドルモニターでは
-    ///        24 秒以上かかることがある）もストリームに映像が届くようにする。
-    ///        使用後は解放してメモリを節約する。
+    /// Frame used to seed the freeze frame of do_streaming_loop(), so video
+    /// flows before DXGI returns its next frame (24 s or more on an idle
+    /// monitor). Set by do_init_and_capture()/do_reconfigure() and re-saved when
+    /// the streaming loop exits; cleared in do_reconfigure()/teardown_all()
+    /// because it may hold a GPU texture of the D3D11 device being released.
     FrameBuffer initial_frame_buf_;
     FrameMeta   initial_frame_meta_{};
 };
 
-// ─── MonitorSupervisor ─────────────────────────────────────
-
 /**
- * @brief すべてのモニターのパイプラインを管理するスーパーバイザー
+ * @brief Owns one ScreenPipeline per monitor.
  *
- * モニターの接続・切断・解像度変更を定期的に検知し、
- * 各モニターに対応する ScreenPipeline を生成・破棄する。
- * メトリクスの定期書き込みも担当する。
+ * Polls for monitor connect/disconnect/resolution changes, creates and
+ * destroys pipelines accordingly, and periodically writes metrics and health files.
  */
 class MonitorSupervisor {
 public:
-    /** @brief コンストラクタ */
     MonitorSupervisor();
 
-    /** @brief デストラクタ */
+    /** @brief Requests stop and joins the background threads. */
     ~MonitorSupervisor();
 
     /**
-     * @brief スーパーバイザーを初期化する
-     * @param config  アプリケーション設定
-     * @param error   エラーメッセージ出力先
-     * @return 成功した場合 true
+     * @brief Init logging, metrics and (if enabled) the shared audio pipeline.
+     *
+     * An audio pipeline start failure is only logged; video streams without audio.
+     * @param config  Application settings
+     * @param[out] error Message on failure (log sink init)
+     * @return true on success
      */
     bool init(const AppConfig& config, std::string& error);
 
-    /**
-     * @brief メインループを実行する
-     *
-     * Ctrl+C などの停止シグナルが来るまで返らない。
-     */
+    /** @brief Run until request_stop() is called, then shut everything down. */
     void run();
 
-    /**
-     * @brief 停止リクエストを送る
-     *
-     * run() のループを終了させる。スレッドセーフ。
-     */
+    /** @brief Make run() return. Thread-safe (called from the console handler). */
     void request_stop();
 
 private:
-    /**
-     * @brief モニター変化ポーリングスレッドのメイン関数
-     *
-     * 定期的に MonitorDetector::enumerate() を呼び出して差分を適用する。
-     */
+
     void monitor_poll_loop();
 
-    /**
-     * @brief メトリクス書き込みスレッドのメイン関数
-     *
-     * 定期的に MetricsStore::save_metrics() / save_health() を呼び出す。
-     */
     void metrics_writer_loop();
 
-    /**
-     * @brief 現在のモニター一覧と前回の一覧を比較して差分を適用する
-     *
-     * 追加・削除・解像度変更を検知し、対応するパイプラインを操作する。
-     *
-     * @param current 現在のモニター一覧
-     */
+    // Diffs against last_monitors_ and starts/stops/notifies pipelines (see the definition).
     void apply_monitor_changes(const std::vector<MonitorInfo>& current);
 
-    AppConfig config_;                          ///< アプリケーション設定
-    std::shared_ptr<LogSink>      log_;         ///< ログシンク
-    std::shared_ptr<MetricsStore> metrics_;     ///< メトリクスストア
-    std::shared_ptr<AudioPipeline> audio_pipeline_;  ///< 共有音声パイプライン (config.audio.enabled が false、または start() 失敗時は nullptr)
+    AppConfig config_;                          ///< Application settings
+    std::shared_ptr<LogSink>      log_;         ///< Log sink
+    std::shared_ptr<MetricsStore> metrics_;     ///< Metrics store
+    std::shared_ptr<AudioPipeline> audio_pipeline_;  ///< Shared audio pipeline; nullptr if audio is disabled or start() failed
 
-    std::map<std::string, std::unique_ptr<ScreenPipeline>> pipelines_;  ///< stable_id→パイプラインのマップ
-    std::mutex pipelines_mutex_;                                         ///< パイプラインマップ保護用 mutex
+    std::map<std::string, std::unique_ptr<ScreenPipeline>> pipelines_;  ///< stable_id -> pipeline
+    std::mutex pipelines_mutex_;                                         ///< Guards pipelines_ and last_monitors_
 
-    std::vector<MonitorInfo> last_monitors_;    ///< 前回のモニター一覧
+    std::vector<MonitorInfo> last_monitors_;    ///< Monitor list from the previous poll
 
-    std::thread monitor_thread_;               ///< モニターポーリングスレッド
-    std::thread metrics_thread_;               ///< メトリクス書き込みスレッド
-    std::atomic<bool> stop_requested_{false};  ///< 停止リクエストフラグ
+    std::thread monitor_thread_;               ///< Monitor polling thread (monitor_poll_loop)
+    std::thread metrics_thread_;               ///< Metrics writer thread (metrics_writer_loop)
+    std::atomic<bool> stop_requested_{false};  ///< Stop requested
 };

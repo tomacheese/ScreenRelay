@@ -5,7 +5,7 @@ DXGI Desktop Duplication API で接続中の全モニターをキャプチャし
 ## 特徴
 
 - **マルチモニターキャプチャ** — 接続されている各ディスプレイを個別の RTSP ストリームとして配信（`/screen1`、`/screen2`、…）
-- **プライマリモニターエイリアス** — `/screen0` は常にプライマリモニターを指す
+- **プライマリモニターエイリアス** — `/screen0` は常にプライマリモニターを指す（注: 組み込みの `rtsp.path_pattern` 既定値は `/live/screen{n}` で、サンプル設定では `/screen{n}` を指定しています）
 - **ハードウェア H.264 エンコード** — NVIDIA NVENC 優先、`h264_mf`（Windows Media Foundation）、`libx264` の順で自動フォールバック
 - **動的モニター検出** — 再起動なしでモニターの接続・切断・解像度変更をランタイムで処理
 - **自動再接続** — DXGI・エンコーダー・RTSP 障害時のエクスポネンシャルバックオフ。モニターの電源サイクル後も自己回復
@@ -37,7 +37,7 @@ DXGI Desktop Duplication API で接続中の全モニターをキャプチャし
 
 ### 1. Releases からダウンロード
 
-1. [最新リリース](https://github.com/tomacheese/screen-relay/releases/latest) を開く
+1. [最新リリース](https://github.com/tomacheese/ScreenRelay/releases/latest) を開く
 2. `screen-relay-vX.Y.Z-win64.zip` をダウンロード
 3. 任意のフォルダ（例: `C:\Tools\screen-relay\`）に展開
 
@@ -45,7 +45,7 @@ DXGI Desktop Duplication API で接続中の全モニターをキャプチャし
 
 - `screen-relay.exe` — 本体実行ファイル
 - `*.dll` — FFmpeg LGPL 共有ライブラリ（同じフォルダに置く必要があります）
-- `config.example.json` — 設定テンプレート（コメント付き）
+- `config.example.json` — 設定テンプレート
 - `README.md`
 
 ### 2. 設定ファイルを作成
@@ -127,7 +127,7 @@ screen-relay.exe --help
 
 ## 設定
 
-完全なサンプル: [`config/config.example.json`](config/config.example.json)  
+サンプル: [`config/config.example.json`](config/config.example.json)  
 設定リファレンス: [`docs/configuration.md`](docs/configuration.md)
 
 ### 最小構成
@@ -149,6 +149,7 @@ screen-relay.exe --help
 screen-relay/
 ├── src/
 │   ├── app/          # MonitorSupervisor + ScreenPipeline + StateMachine
+│   ├── audio/        # WASAPI キャプチャ、AAC エンコーダー、共有 AudioPipeline
 │   ├── capture/      # ICaptureBackend、DxgiCaptureBackend、FramePump
 │   ├── common/       # 型定義、エラーコード、時刻ユーティリティ
 │   ├── config/       # JSON 設定ローダー
@@ -162,7 +163,7 @@ screen-relay/
 ├── config/
 │   ├── config.example.json
 │   └── config.json   # （.gitignore 対象、ローカル設定）
-└── docs/             # カテゴリ別ドキュメント（日本語）
+└── docs/             # カテゴリ別ドキュメント（英語）
 ```
 
 ## ドキュメント一覧
@@ -175,10 +176,15 @@ screen-relay/
 | [docs/state-machine.md](docs/state-machine.md) | ステートマシン：状態・遷移・エラー処理 |
 | [docs/metrics.md](docs/metrics.md) | メトリクス/ヘルス JSON フォーマット、イベントログ |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | よくあるエラーと解決策 |
+| [docs/design.md](docs/design.md) | 設計メモと設計意図 |
+
+> docs/ 配下のドキュメントは英語で記述されています。このファイルは [README.md](README.md) の日本語訳です。
 
 ## テストの実行
 
 ```powershell
+# FFmpeg の DLL を PATH に通す（または exe と同じ場所に置く）
+$env:PATH = "$PWD\deps\ffmpeg\bin;$env:PATH"
 build/tests/screen_relay_tests.exe
 # 期待結果の末尾: All tests passed.
 ```

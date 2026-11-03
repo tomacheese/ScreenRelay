@@ -3,37 +3,13 @@
 #include <chrono>
 #include <utility>
 
-// ---------------------------------------------------------------------------
-// コンストラクタ / デストラクタ
-// ---------------------------------------------------------------------------
-
-/**
- * @brief コンストラクタ
- *
- * メンバー変数をデフォルト初期化するのみ。スレッドは start() で起動する。
- */
 FramePump::FramePump() = default;
 
-/**
- * @brief デストラクタ
- *
- * 実行中の場合は stop() を呼び出してスレッドを安全に結合する。
- */
 FramePump::~FramePump() {
     stop();
 }
 
-// ---------------------------------------------------------------------------
-// 公開メソッド
-// ---------------------------------------------------------------------------
-
-/**
- * @brief キャプチャを開始する
- * @param backend          キャプチャバックエンド (所有権なし)
- * @param frame_timeout_ms フレーム取得タイムアウト (ms)
- */
 void FramePump::start(ICaptureBackend* backend, int frame_timeout_ms) {
-    // 既に実行中なら何もしない
     if (running_.load()) {
         return;
     }
@@ -47,7 +23,7 @@ void FramePump::start(ICaptureBackend* backend, int frame_timeout_ms) {
     backend_hard_error_.store(false);
     running_.store(true);
 
-    // 再起動時に残留した古い解像度のフレームをクリアする
+    // Drop stale frames (possibly at an old resolution) left over from a previous run.
     {
         std::lock_guard<std::mutex> lk(mutex_);
         while (!queue_.empty()) queue_.pop();
@@ -57,16 +33,10 @@ void FramePump::start(ICaptureBackend* backend, int frame_timeout_ms) {
     thread_ = std::thread(&FramePump::capture_thread_func, this);
 }
 
-/**
- * @brief キャプチャを停止し、スレッドを結合する
- *
- * running_ フラグを false にしてスレッドの終了を待つ。
- * 既に停止している場合は何もしない。
- */
 void FramePump::stop() {
     running_.store(false);
 
-    // 条件変数で待機中のコンシューマーを起こす
+    // Wake consumers blocked in wait_pop().
     cv_.notify_all();
 
     if (thread_.joinable()) {
@@ -74,15 +44,6 @@ void FramePump::stop() {
     }
 }
 
-/**
- * @brief フレームをノンブロッキングで取得する
- *
- * キューにフレームがある場合のみ取り出して true を返す。
- *
- * @param[out] buf   取得したフレームバッファ
- * @param[out] meta  取得したフレームメタデータ
- * @return キューからフレームを取得できた場合 true
- */
 bool FramePump::try_pop(FrameBuffer& buf, FrameMeta& meta) {
     std::lock_guard<std::mutex> lk(mutex_);
 
@@ -98,23 +59,13 @@ bool FramePump::try_pop(FrameBuffer& buf, FrameMeta& meta) {
     return true;
 }
 
-/**
- * @brief フレームをタイムアウト付きで取得する
- *
- * キューにフレームが到着するまで最大 timeout_ms ミリ秒待機する。
- *
- * @param[out] buf        取得したフレームバッファ
- * @param[out] meta       取得したフレームメタデータ
- * @param      timeout_ms タイムアウト (ms)
- * @return フレームを取得できた場合 true
- */
 bool FramePump::wait_pop(FrameBuffer& buf, FrameMeta& meta, int timeout_ms) {
     std::unique_lock<std::mutex> lk(mutex_);
 
     const auto deadline = std::chrono::steady_clock::now() +
                           std::chrono::milliseconds(timeout_ms);
 
-    // キューが空かつ実行中かつハードエラーなしの間は待機する
+    // Wakes on: frame available, pump stopped, or backend hard error.
     bool notified = cv_.wait_until(lk, deadline, [this]() {
         return !queue_.empty() || !running_.load() || backend_hard_error_.load();
     });
@@ -131,26 +82,14 @@ bool FramePump::wait_pop(FrameBuffer& buf, FrameMeta& meta, int timeout_ms) {
     return true;
 }
 
-// ---------------------------------------------------------------------------
-// プライベートメソッド
-// ---------------------------------------------------------------------------
-
-/**
- * @brief バックグラウンドキャプチャスレッドのエントリポイント
- *
- * running_ が false になるまでループし、backend_ からフレームを取得して
- * キューに格納する。キューが MAX_QUEUE_SIZE を超えた場合は最古フレームを破棄する。
- * acquire_frame() が内部でタイムアウト待機を行うため、追加のスリープは不要。
- */
 void FramePump::capture_thread_func() {
     while (running_.load()) {
-        // フレームを取得する。acquire_frame は frame_timeout_ms_ 分待機する
+        // acquire_frame() blocks up to frame_timeout_ms_, so the loop needs no extra sleep.
         auto opt = backend_->acquire_frame(frame_timeout_ms_);
 
         if (opt.has_value()) {
             FrameBuffer fb = std::move(*opt);
 
-            // フレームメタデータを構築する
             FrameMeta meta;
             meta.sequence     = frame_seq_++;
             meta.width        = fb.width;
@@ -160,7 +99,7 @@ void FramePump::capture_thread_func() {
             {
                 std::lock_guard<std::mutex> lk(mutex_);
 
-                // キューが満杯の場合は最古フレームを破棄する
+                // Drop the oldest frame when the queue is full.
                 if (static_cast<int>(queue_.size()) >= MAX_QUEUE_SIZE) {
                     queue_.pop();
                 }
@@ -168,14 +107,11 @@ void FramePump::capture_thread_func() {
                 queue_.emplace(std::move(fb), std::move(meta));
             }
 
-            // コンシューマーにフレーム到着を通知する
             cv_.notify_one();
         } else if (backend_->has_hard_error()) {
-            // ACCESS_LOST 等のハードエラー発生時はフラグをセットしてコンシューマーを即座に起こす
-            // backend_hard_error_ を先にセットすることで wait_pop の述語が確実に true になる
+            // Set the flag before notifying so the wait_pop() predicate is guaranteed to see it.
             backend_hard_error_.store(true);
             cv_.notify_all();
         }
-        // acquire_frame がタイムアウトした場合は追加のスリープなしに次のループへ進む
     }
 }

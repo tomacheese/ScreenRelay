@@ -6,101 +6,97 @@
 #include "common/types.hpp"
 
 /**
- * @brief キャプチャバックエンドの抽象インターフェース
- *
- * DXGI Duplication など、複数のキャプチャ手段に対して共通の操作を提供する。
- * 実装クラスはこのインターフェースを継承して各バックエンド固有の処理を記述する。
+ * @brief Abstract interface for screen capture backends (e.g. DXGI Duplication).
  */
 class ICaptureBackend {
 public:
-    /** デストラクタ。派生クラスのリソースを確実に解放するため virtual にする */
     virtual ~ICaptureBackend() = default;
 
     /**
-     * @brief 指定モニターに対してキャプチャを初期化する
-     * @param monitor          対象 HMONITOR
-     * @param logical_width    論理解像度の幅
-     * @param logical_height   論理解像度の高さ
-     * @return 成功した場合 true
+     * @brief Initializes capture for the given monitor.
+     * @param monitor          Target HMONITOR
+     * @param logical_width    Logical (output) width
+     * @param logical_height   Logical (output) height
+     * @return true on success
      */
     virtual bool init(HMONITOR monitor, int logical_width, int logical_height) = 0;
 
     /**
-     * @brief 最新フレームを取得する
-     * @param timeout_ms   タイムアウト (ms)
-     * @return フレームバッファ。フレームなし (タイムアウト等) なら nullopt
+     * @brief Acquires the latest frame.
+     * @param timeout_ms   Timeout in milliseconds
+     * @return The frame, or nullopt if no frame is available (timeout, error)
      */
     virtual std::optional<FrameBuffer> acquire_frame(int timeout_ms) = 0;
 
     /**
-     * @brief 解像度変更を通知して再構成する
-     * @param new_width   新しい論理幅
-     * @param new_height  新しい論理高さ
-     * @return 成功した場合 true
+     * @brief Applies a new logical resolution.
+     * @param new_width   New logical width
+     * @param new_height  New logical height
+     * @return true on success
      */
     virtual bool reconfigure(int new_width, int new_height) = 0;
 
     /**
-     * @brief キャプチャリソースを解放する
+     * @brief Releases capture resources.
      *
-     * デストラクタからも呼ばれることを想定し、二重解放に対して安全であること。
+     * May also be called from the destructor, so it must be safe to call repeatedly.
      */
     virtual void release() = 0;
 
     /**
-     * @brief 最後のエラーメッセージを返す
+     * @brief Returns the last error message.
      *
-     * スレッドセーフな実装が必要な場合は派生クラスでオーバーライドする。
+     * Override when a thread-safe implementation is needed.
      *
-     * @return エラーメッセージ文字列のコピー
+     * @return A copy of the error message
      */
     virtual std::string last_error() const {
         return {};
     }
 
     /**
-     * @brief DXGI ACCESS_LOST 等、再初期化が必要なハードエラーが発生しているか返す
+     * @brief Returns whether a hard error that requires re-initialization
+     *        (e.g. DXGI ACCESS_LOST) has occurred.
      *
-     * タイムアウト（画面変化なし）とは区別する。
-     * ハードエラーが発生したらフレームポンプはコンシューマーに即座に通知する。
+     * Distinct from a timeout (no screen change). On a hard error the frame
+     * pump immediately notifies consumers.
      *
-     * @return ハードエラーが発生していれば true
+     * @return true if a hard error has occurred
      */
     virtual bool has_hard_error() const { return false; }
 
     /**
-     * @brief GPU ゼロコピーパスで共有する D3D11 デバイスを返す
+     * @brief Returns the D3D11 device shared with the GPU zero-copy path.
      *
-     * EncoderController が同一デバイス上にハードウェアフレームコンテキストを
-     * 構築できるようにするために使用する。同一デバイスを共有することで、
-     * キャプチャしたテクスチャをエンコーダーに渡す際のコピーが GPU 内で完結し、
-     * CPU を介したデータ転送（Map/memcpy/sws_scale）を回避できる。
+     * EncoderController builds its hardware frame context on this same device,
+     * so passing captured textures to the encoder stays inside the GPU
+     * (no CPU Map/memcpy/sws_scale).
      *
-     * @return ID3D11Device* (型消去)。GPU ゼロコピーをサポートしない
-     *         バックエンドや未初期化の場合は nullptr
+     * @return Type-erased ID3D11Device*, or nullptr if the backend does not
+     *         support zero-copy or is not initialized
      */
     virtual void* gpu_device() const { return nullptr; }
 
     /**
-     * @brief GPU ゼロコピーパスが利用可能かどうかを返す
+     * @brief Returns whether the GPU zero-copy path is available.
      *
-     * 物理解像度と論理解像度が一致しスケーリングが不要な場合のみ true を返す。
-     * スケーリングが必要な場合は GPU 側での変換実装が必要になるため、
-     * 現状では CPU パス（sws_scale）にフォールバックする。
+     * True only when physical and logical resolutions match (no scaling).
+     * GPU-side scaling is not implemented, so scaled captures fall back to
+     * the CPU path (sws_scale).
      *
-     * @return ゼロコピーパスが利用可能なら true
+     * @return true if zero-copy is available
      */
     virtual bool supports_zero_copy() const { return false; }
 
     /**
-     * @brief ゼロコピーモードの有効・無効を切り替える
+     * @brief Enables or disables zero-copy mode.
      *
-     * 有効化すると、acquire_frame() は CPU 側のメモリコピー・色空間変換を
-     * 行わず、GPU テクスチャ参照のみを FrameBuffer::gpu_texture に設定する。
-     * EncoderController が GPU ゼロコピーパスを確立できた場合にのみ
-     * 呼び出し元（ScreenPipeline）が有効化する。
+     * When enabled, acquire_frame() skips CPU copy and color conversion and
+     * only sets a GPU texture reference in FrameBuffer::gpu_texture. The caller
+     * (ScreenPipeline) enables it only after EncoderController has established
+     * the GPU zero-copy path.
      *
-     * @param enabled true で有効化、false で無効化（CPU パスへ復帰）
+     * @param enabled true to enable, false to return to the CPU path
      */
     virtual void set_zero_copy_mode(bool enabled) { (void)enabled; }
 };

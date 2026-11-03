@@ -3,19 +3,18 @@
 #include "test_utils.hpp"
 
 /**
- * @brief AudioSubscriberQueue のユニットテストを実行する
+ * @brief Tests AudioSubscriberQueue and AudioPipeline subscribe/unsubscribe.
  *
- * WASAPI 実デバイスに依存しない範囲（購読キューの push/pop、AudioPipeline の
- * 購読・購読解除の管理）のみを対象とする。実デバイスが必要な
- * pipeline_thread_func() 内のブロードキャスト処理自体は対象外。
+ * Covers only what needs no real WASAPI device; the broadcast loop in
+ * pipeline_thread_func() is not tested.
  *
- * @return 成功時 0 (失敗時は VERIFY マクロにより exit(1))
+ * @return 0 on success (a failing VERIFY exits with status 1)
  */
 int run_audio_pipeline_tests() {
     printf("=== Audio Pipeline Tests ===\n");
 
     {
-        // push したパケットを try_pop で取得できること (FIFO 順)
+        // Pushed packets come back from try_pop in FIFO order
         AudioSubscriberQueue q;
         EncodedPacket p1; p1.pts = 1;
         EncodedPacket p2; p2.pts = 2;
@@ -28,27 +27,27 @@ int run_audio_pipeline_tests() {
         VERIFY(q.try_pop(out));
         VERIFY(out.pts == 2);
         VERIFY(!q.try_pop(out));
-        printf("[PASS] push したパケットが FIFO 順で取得できる\n");
+        printf("[PASS] pushed packets are popped in FIFO order\n");
     }
 
     {
-        // 空のキューで try_pop が false を返すこと
+        // try_pop on an empty queue returns false
         AudioSubscriberQueue q;
         EncodedPacket out;
         VERIFY(!q.try_pop(out));
-        printf("[PASS] 空のキューでは try_pop が false を返す\n");
+        printf("[PASS] try_pop returns false on an empty queue\n");
     }
 
     {
-        // wait_pop がタイムアウトで false を返すこと
+        // wait_pop returns false on timeout
         AudioSubscriberQueue q;
         EncodedPacket out;
         VERIFY(!q.wait_pop(out, 50));
-        printf("[PASS] wait_pop がタイムアウトで false を返す\n");
+        printf("[PASS] wait_pop returns false on timeout\n");
     }
 
     {
-        // 最大サイズを超えた場合に最古パケットが破棄されること
+        // Overflowing the queue drops the oldest packets
         AudioSubscriberQueue q;
         for (int i = 0; i < 100; ++i) {
             EncodedPacket p; p.pts = i;
@@ -57,12 +56,12 @@ int run_audio_pipeline_tests() {
         EncodedPacket out;
         VERIFY(q.try_pop(out));
         VERIFY_MSG(out.pts > 0, "Oldest packets should have been dropped");
-        printf("[PASS] キュー上限超過時に最古パケットが破棄される\n");
+        printf("[PASS] the oldest packet is dropped when the queue limit is exceeded\n");
     }
 
     {
-        // AudioPipeline の購読・購読解除が例外なく動作すること
-        // (実デバイスへの依存を避けるため start() は呼ばない)
+        // subscribe/unsubscribe work without throwing
+        // (start() is not called to avoid needing a real device)
         AudioPipeline pipeline;
         auto sub1 = pipeline.subscribe();
         auto sub2 = pipeline.subscribe();
@@ -72,7 +71,7 @@ int run_audio_pipeline_tests() {
         pipeline.unsubscribe(sub1);
         pipeline.unsubscribe(sub2);
         VERIFY(!pipeline.is_running());
-        printf("[PASS] AudioPipeline の購読・購読解除が動作する\n");
+        printf("[PASS] AudioPipeline subscribe / unsubscribe works\n");
     }
 
     return 0;

@@ -3,16 +3,15 @@
 #include "test_utils.hpp"
 
 /**
- * @brief StateMachine のユニットテストを実行する
- *
- * 有効遷移・無効遷移・終端ステート・コールバック発火を検証する。
- * @return 成功時 0 (失敗時は VERIFY マクロにより exit(1))
+ * @brief Tests StateMachine: valid and invalid transitions, terminal states and the
+ *        transition callback.
+ * @return 0 on success (a failing VERIFY exits with status 1)
  */
 int run_state_machine_tests() {
     printf("=== State Machine Tests ===\n");
 
     {
-        // INIT → CAPTURING (有効遷移)
+        // INIT → CAPTURING
         StateMachine sm;
         VERIFY(sm.current_state() == PipelineState::INIT);
         bool ok = sm.transition_to(PipelineState::CAPTURING);
@@ -22,7 +21,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // INIT → FATAL (有効遷移)
+        // INIT → FATAL
         StateMachine sm;
         bool ok = sm.transition_to(PipelineState::FATAL);
         VERIFY_MSG(ok, "INIT → FATAL should succeed");
@@ -31,7 +30,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // CAPTURING → CONNECTING (有効遷移)
+        // CAPTURING → CONNECTING
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         bool ok = sm.transition_to(PipelineState::CONNECTING);
@@ -40,7 +39,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // CONNECTING → STREAMING (有効遷移)
+        // CONNECTING → STREAMING
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -50,7 +49,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // STREAMING → RECONNECTING (有効遷移)
+        // STREAMING → RECONNECTING
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -61,7 +60,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // STREAMING → RECONFIGURING (有効遷移)
+        // STREAMING → RECONFIGURING
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -72,7 +71,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // RECONNECTING → STREAMING (有効遷移)
+        // RECONNECTING → STREAMING
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -84,7 +83,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // RECONFIGURING → CAPTURING (有効遷移)
+        // RECONFIGURING → CAPTURING
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -96,25 +95,25 @@ int run_state_machine_tests() {
     }
 
     {
-        // 無効遷移: INIT → STREAMING は拒否される
+        // Invalid: INIT → STREAMING is rejected
         StateMachine sm;
         bool ok = sm.transition_to(PipelineState::STREAMING);
         VERIFY_MSG(!ok, "INIT → STREAMING must be rejected");
         VERIFY(sm.current_state() == PipelineState::INIT);
-        printf("[PASS] 無効遷移 INIT → STREAMING が拒否される\n");
+        printf("[PASS] invalid transition INIT -> STREAMING is rejected\n");
     }
 
     {
-        // 無効遷移: INIT → RECONNECTING は拒否される
+        // Invalid: INIT → RECONNECTING is rejected
         StateMachine sm;
         bool ok = sm.transition_to(PipelineState::RECONNECTING);
         VERIFY_MSG(!ok, "INIT → RECONNECTING must be rejected");
         VERIFY(sm.current_state() == PipelineState::INIT);
-        printf("[PASS] 無効遷移 INIT → RECONNECTING が拒否される\n");
+        printf("[PASS] invalid transition INIT -> RECONNECTING is rejected\n");
     }
 
     {
-        // STOPPING に到達したらそれ以上遷移できないこと
+        // STOPPING is terminal
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::STOPPING);
@@ -122,22 +121,22 @@ int run_state_machine_tests() {
         bool ok = sm.transition_to(PipelineState::CAPTURING);
         VERIFY_MSG(!ok, "STOPPING → CAPTURING must be rejected");
         VERIFY(sm.current_state() == PipelineState::STOPPING);
-        printf("[PASS] STOPPING は終端ステートでそれ以上遷移できない\n");
+        printf("[PASS] STOPPING is terminal and allows no further transitions\n");
     }
 
     {
-        // FATAL に到達したらそれ以上遷移できないこと
+        // FATAL is terminal
         StateMachine sm;
         sm.transition_to(PipelineState::FATAL);
         VERIFY(sm.current_state() == PipelineState::FATAL);
         bool ok = sm.transition_to(PipelineState::CAPTURING);
         VERIFY_MSG(!ok, "FATAL → CAPTURING must be rejected");
         VERIFY(sm.current_state() == PipelineState::FATAL);
-        printf("[PASS] FATAL は終端ステートでそれ以上遷移できない\n");
+        printf("[PASS] FATAL is terminal and allows no further transitions\n");
     }
 
     {
-        // CONNECTING → FATAL (有効遷移: エンコーダー初期化失敗時に使用)
+        // CONNECTING → FATAL (valid; used when encoder init fails)
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -148,7 +147,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // RECONFIGURING → FATAL (有効遷移: DXGI 再初期化失敗時に使用)
+        // RECONFIGURING → FATAL (valid; used when DXGI re-init fails)
         StateMachine sm;
         sm.transition_to(PipelineState::CAPTURING);
         sm.transition_to(PipelineState::CONNECTING);
@@ -161,7 +160,7 @@ int run_state_machine_tests() {
     }
 
     {
-        // 遷移コールバックが正しく発火すること
+        // The transition callback fires with (from, to)
         StateMachine sm;
         PipelineState cb_from = PipelineState::INIT;
         PipelineState cb_to   = PipelineState::INIT;
@@ -172,7 +171,7 @@ int run_state_machine_tests() {
         sm.transition_to(PipelineState::CAPTURING);
         VERIFY(cb_from == PipelineState::INIT);
         VERIFY(cb_to   == PipelineState::CAPTURING);
-        printf("[PASS] 遷移コールバックが正しく発火する\n");
+        printf("[PASS] transition callback fires correctly\n");
     }
 
     return 0;

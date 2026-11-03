@@ -5,47 +5,32 @@
 #include <iomanip>
 #include <sstream>
 
-/**
- * @brief 時刻・タイマーユーティリティ
- *
- * 単調時計・システム時計の取得と ISO 8601 文字列変換を提供する。
- */
+/** Monotonic / wall-clock helpers and ISO 8601 formatting. */
 namespace time_utils {
 
-/**
- * @brief 単調時計の現在時刻をミリ秒で返す
- * @return ミリ秒単位の時刻 (エポック起点)
- */
+/** @brief Monotonic (steady_clock) time in milliseconds; the epoch is unspecified, so use only for intervals. */
 inline int64_t now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-/**
- * @brief 単調時計の現在時刻をマイクロ秒で返す
- * @return マイクロ秒単位の時刻 (エポック起点)
- */
+/** @brief Monotonic (steady_clock) time in microseconds; the epoch is unspecified. */
 inline int64_t now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
-/**
- * @brief システム時計の現在時刻をミリ秒で返す
- * @return ミリ秒単位の時刻 (UNIX エポック起点)
- */
+/** @brief Wall-clock (system_clock) time in milliseconds since the UNIX epoch. */
 inline int64_t system_now_ms() {
     return std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::system_clock::now().time_since_epoch()).count();
 }
 
 /**
- * @brief システム時計の現在時刻をマイクロ秒で返す
+ * @brief Wall-clock (system_clock) time in microseconds since the UNIX epoch.
  *
- * FFmpeg の av_gettime() と同一のエポック (UNIX エポック) を使用するため、
- * RTSP の start_time_realtime との比較・計算に直接利用できる。
- *
- * @return マイクロ秒単位の時刻 (UNIX エポック起点)
+ * Uses the same epoch as FFmpeg's av_gettime(), so it can be compared directly
+ * with RTSP start_time_realtime.
  */
 inline int64_t system_now_us() {
     return std::chrono::duration_cast<std::chrono::microseconds>(
@@ -53,10 +38,9 @@ inline int64_t system_now_us() {
 }
 
 /**
- * @brief 現在時刻を ISO 8601 形式の文字列で返す
+ * @brief Current UTC time as ISO 8601 with milliseconds, e.g. "2026-05-01T00:00:00.000Z".
  *
- * 例: "2026-05-01T00:00:00.000Z"
- * @return ISO 8601 形式のタイムスタンプ文字列
+ * Returns the 1970 epoch string if the UTC conversion fails.
  */
 inline std::string iso8601_now() {
     auto now       = std::chrono::system_clock::now();
@@ -77,48 +61,30 @@ inline std::string iso8601_now() {
     return oss.str();
 }
 
-/**
- * @brief 経過時間計測クラス
- *
- * 生成時点からの経過時間をミリ秒・マイクロ秒で取得できる。
- */
+/** @brief Elapsed-time measurement on steady_clock, started at construction or reset(). */
 class Stopwatch {
 public:
-    /** @brief コンストラクタ。計測開始時刻を記録する。 */
     Stopwatch() : start_(std::chrono::steady_clock::now()) {}
 
-    /** @brief 計測開始時刻をリセットする */
     void reset() { start_ = std::chrono::steady_clock::now(); }
 
-    /**
-     * @brief 経過時間をミリ秒で返す
-     * @return 経過ミリ秒
-     */
     int64_t elapsed_ms() const {
         return std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - start_).count();
     }
 
-    /**
-     * @brief 経過時間をマイクロ秒で返す
-     * @return 経過マイクロ秒
-     */
     int64_t elapsed_us() const {
         return std::chrono::duration_cast<std::chrono::microseconds>(
             std::chrono::steady_clock::now() - start_).count();
     }
 
-    /**
-     * @brief 指定したタイムアウト時間が経過しているか判定する
-     * @param timeout_ms タイムアウト時間 (ms)
-     * @return タイムアウトしていれば true
-     */
+    /** @brief True once at least @p timeout_ms milliseconds have elapsed. */
     bool expired(int64_t timeout_ms) const {
         return elapsed_ms() >= timeout_ms;
     }
 
 private:
-    std::chrono::steady_clock::time_point start_;  ///< 計測開始時刻
+    std::chrono::steady_clock::time_point start_;
 };
 
 } // namespace time_utils

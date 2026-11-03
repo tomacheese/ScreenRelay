@@ -13,98 +13,85 @@
 #include <vector>
 
 /**
- * @brief WASAPI を使用した音声キャプチャバックエンド
+ * @brief WASAPI audio capture backend.
  *
- * source == "loopback" の場合はレンダリングデバイス（既定 or 指定デバイス）が
- * 再生している音声を IAudioClient のループバックモードで取得する。
- * source == "capture" の場合は録音デバイス（マイク等）から直接取得する。
+ * source == "loopback" captures what a render device (default or specified) is playing,
+ * using IAudioClient loopback mode. source == "capture" reads a recording device
+ * (e.g. a microphone) directly.
  *
- * バックグラウンドスレッドがイベント駆動でバッファを取得し、内部の境界キューに
- * 格納する。コンシューマースレッドは try_pop / wait_pop で取り出す。
+ * A background thread pulls buffers event-driven into a bounded internal queue;
+ * consumers drain it with try_pop / wait_pop.
  */
 class WasapiAudioCapture {
 public:
-    /** @brief コンストラクタ */
     WasapiAudioCapture();
 
-    /** @brief デストラクタ。release() を呼び出してリソースを解放する */
     ~WasapiAudioCapture();
 
     /**
-     * @brief 利用可能な音声デバイスを列挙する
-     *
-     * レンダリングデバイス（ループバック用）と録音デバイスの両方を返す。
-     *
-     * @param error エラーメッセージ出力先
-     * @return デバイス情報のリスト（失敗時は空）
+     * @brief Enumerates active audio devices (render devices for loopback, and capture devices).
+     * @param error Receives an error message on failure
+     * @return Device list (empty on failure)
      */
     static std::vector<AudioDeviceInfo> enumerate_devices(std::string& error);
 
     /**
-     * @brief 音声キャプチャを初期化してバックグラウンドスレッドを開始する
-     *
-     * @param config 音声設定（source / device_id を参照する）
-     * @param error  エラーメッセージ出力先
-     * @return 成功した場合 true
+     * @brief Opens the device and starts the capture thread.
+     * @param config Audio settings (source / device_id are used)
+     * @param error  Receives an error message on failure
+     * @return true on success
      */
     bool init(const AudioConfig& config, std::string& error);
 
-    /** @brief キャプチャデバイスの実際のサンプルレート (Hz) を返す */
+    /** @brief Actual device sample rate (Hz); valid after init(). */
     int sample_rate() const { return sample_rate_; }
 
-    /** @brief キャプチャデバイスの実際のチャンネル数を返す */
+    /** @brief Actual device channel count. */
     int channels() const { return channels_; }
 
-    /** @brief キャプチャデバイスのサンプルフォーマットが IEEE float かどうかを返す */
+    /** @brief Whether the device sample format is IEEE float (otherwise int PCM). */
     bool is_float() const { return is_float_; }
 
-    /** @brief キャプチャデバイスの 1 サンプルあたりのビット数を返す */
+    /** @brief Bits per sample of the device format. */
     int bits_per_sample() const { return bits_per_sample_; }
 
     /**
-     * @brief バッファをノンブロッキングで取得する
-     * @param[out] buf  取得したバッファ
-     * @param[out] meta 取得したメタデータ
-     * @return 取得できた場合 true
+     * @brief Non-blocking pop of the oldest buffer.
+     * @param[out] buf  Popped buffer
+     * @param[out] meta Its metadata
+     * @return true if a buffer was available
      */
     bool try_pop(AudioBuffer& buf, AudioMeta& meta);
 
     /**
-     * @brief バッファをタイムアウト付きで取得する
-     * @param[out] buf        取得したバッファ
-     * @param[out] meta       取得したメタデータ
-     * @param      timeout_ms タイムアウト (ms)
-     * @return 取得できた場合 true、タイムアウトなら false
+     * @brief Pops the oldest buffer, waiting up to timeout_ms.
+     * @param[out] buf        Popped buffer
+     * @param[out] meta       Its metadata
+     * @param      timeout_ms Timeout (ms)
+     * @return true if a buffer was popped, false on timeout
      */
     bool wait_pop(AudioBuffer& buf, AudioMeta& meta, int timeout_ms);
 
     /**
-     * @brief 回復不能なキャプチャエラーが発生しているか返す
-     * @return エラー発生時 true
+     * @brief Whether an unrecoverable capture error occurred.
+     *
+     * Once set, the capture thread has stopped; call init() again to recover.
      */
     bool has_hard_error() const { return hard_error_.load(); }
 
-    /**
-     * @brief 最後のエラーメッセージを返す
-     * @return エラーメッセージ文字列のコピー
-     */
+    /** @brief Copy of the last error message recorded by the capture thread. */
     std::string last_error() const {
         std::lock_guard<std::mutex> lk(last_error_mutex_);
         return last_error_;
     }
 
-    /**
-     * @brief キャプチャスレッドを停止してすべてのリソースを解放する
-     *
-     * 二重呼び出しに対して安全。
-     */
+    /** @brief Stops the capture thread and releases all resources. Safe to call repeatedly. */
     void release();
 
 private:
-    /** @brief バックグラウンドキャプチャスレッドのエントリポイント */
     void capture_thread_func();
 
-    /** キューの最大サイズ。超過した場合は最古バッファを破棄する */
+    /** Queue capacity; the oldest buffer is dropped on overflow. */
     static constexpr int kMaxQueueSize = 32;
 
     struct Impl;

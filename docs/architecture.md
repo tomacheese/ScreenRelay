@@ -1,19 +1,21 @@
-# アーキテクチャ
+# Architecture
 
-## 概要
+## Overview
 
-screen-relay は、Windows の DXGI Desktop Duplication API を使用して複数モニターの映像をキャプチャし、H.264 エンコード後に RTSP で配信するアプリケーションです。
+screen-relay captures every connected monitor with the Windows DXGI Desktop Duplication API, encodes each one as H.264, and publishes it over RTSP.
 
 ---
 
-## システム構成図
+## System diagram
 
 ```text
 ┌──────────────────────────────────────────────────────────────────────┐
 │   MonitorSupervisor                                                  │
 │   ┌──────────────────────────────────────────────────────────────┐   │
 │   │  monitor_poll_loop              metrics_writer_loop          │   │
-│   │  (1秒ごとにモニター変更を検出)    (1秒ごとにJSON出力)         │   │
+│   │  (detects monitor changes       (writes JSON every           │   │
+│   │   every monitor_check_          emit_metrics_interval_ms)    │   │
+│   │   interval_ms)                                               │   │
 │   └──────────────────────────────────────────────────────────────┘   │
 │                                                                      │
 │  ┌─────────────────────┐   ┌─────────────────────┐                  │
@@ -28,11 +30,12 @@ screen-relay は、Windows の DXGI Desktop Duplication API を使用して複�
    │  DxgiCaptureBackend  │
    │  IDXGIOutputDupl     │
    └──────────┬───────────┘
-              │ BGRA フレーム
+              │ BGRA frame (or GPU texture in zero-copy mode)
               ▼
    ┌──────────────────────┐
    │   FramePump          │
-   │   (有界キュー 最大4)  │
+   │   (bounded queue,    │
+   │    max 4 frames)     │
    └──────────┬───────────┘
               │
               ▼
@@ -41,57 +44,57 @@ screen-relay は、Windows の DXGI Desktop Duplication API を使用して複�
    │  nvenc→mf→libx264    │
    │  (FFmpeg + swscale)  │
    └──────────┬───────────┘
-              │ H.264 NAL パケット
+              │ H.264 NAL packets
               ▼
    ┌──────────────────────────────────────────────────────────────────┐
-   │  RtspPublisherClient × N (通常1本、プライマリは2本)              │
-   │  /screen1  (+/screen0 for primary)                               │
+   │  RtspPublisherClient × N (one per URL; two for the primary)      │
+   │  /screen1  (+ /screen0 for the primary)                          │
    └──────────┬─────────────────────────────────────────────────────┘
-              │ RTP/TCP
+              │ RTP over TCP (interleaved)
               ▼
    ┌──────────────────────┐
-   │   MediaMTX (等)      │
-   │   RTSP サーバー      │
+   │   MediaMTX (etc.)    │
+   │   RTSP server        │
    └──────────────────────┘
 ```
 
 ---
 
-## コンポーネント説明
+## Components
 
-| コンポーネント | クラス | 役割 |
+| Component | Class | Role |
 |---|---|---|
-| オーケストレーター | `MonitorSupervisor` | モニター変更検出、ScreenPipeline のライフサイクル管理 |
-| パイプライン | `ScreenPipeline` | 1 モニター分のキャプチャ→エンコード→配信 |
-| ステートマシン | `StateMachine` | 状態遷移テーブルの強制、コールバック通知 |
-| キャプチャバックエンド | `DxgiCaptureBackend` | DXGI Desktop Duplication API によるスクリーン取得 |
-| キャプチャキュー | `FramePump` | キャプチャスレッド実行、最大 4 フレームの有界キュー |
-| エンコーダー | `EncoderController` | FFmpeg H.264 エンコード（NVENC/h264_mf/libx264）、swscale BGRA→YUV |
-| RTSP クライアント | `RtspPublisherClient` | FFmpeg RTSP ANNOUNCE+SETUP+RECORD、RTP パケット送信 |
-| メトリクス | `MetricsStore` | スレッドセーフなカウンター、health.json / metrics.json 出力 |
-| ログ | `LogSink` | spdlog ベース JSON Lines ログ（ファイル＋コンソール） |
-| 設定 | `ConfigLoader` | nlohmann/json による設定ロード・バリデーション |
-| モニター検出 | `MonitorDetector` | EnumDisplayMonitors によるモニター一覧取得 |
-| 音声キャプチャ | `WasapiAudioCapture` | WASAPI によるループバック/録音デバイスからの PCM 取得 |
-| 音声エンコーダー | `AudioEncoderController` | FFmpeg AAC エンコード、libswresample によるリサンプリング |
-| 音声パイプライン | `AudioPipeline` | 共有キャプチャ→エンコードスレッド、全 ScreenPipeline へのブロードキャスト |
+| Orchestrator | `MonitorSupervisor` | Detects monitor changes and manages the `ScreenPipeline` lifecycle |
+| Pipeline | `ScreenPipeline` | Capture → encode → publish for one monitor |
+| State machine | `StateMachine` | Enforces the transition table and notifies via callback |
+| Capture backend | `DxgiCaptureBackend` | Screen capture through the DXGI Desktop Duplication API |
+| Capture queue | `FramePump` | Runs the capture thread; bounded queue of at most 4 frames |
+| Encoder | `EncoderController` | FFmpeg H.264 encoding (NVENC / h264_mf / libx264); swscale BGRA→YUV on the CPU path |
+| RTSP client | `RtspPublisherClient` | FFmpeg RTSP ANNOUNCE + SETUP + RECORD, RTP packet sending |
+| Metrics | `MetricsStore` | Thread-safe counters; writes `health.json` / `metrics.json` |
+| Logging | `LogSink` | spdlog-based JSON Lines log (file + console) |
+| Config | `ConfigLoader` | Config loading and validation with nlohmann/json |
+| Monitor detection | `MonitorDetector` | Monitor enumeration via `EnumDisplayMonitors` |
+| Audio capture | `WasapiAudioCapture` | PCM capture from a loopback or capture device via WASAPI |
+| Audio encoder | `AudioEncoderController` | FFmpeg AAC encoding; resampling with libswresample |
+| Audio pipeline | `AudioPipeline` | Shared capture→encode thread; broadcasts to every `ScreenPipeline` |
 
 ---
 
-## データフロー
+## Data flow
 
 ```text
 [DXGI IDXGIOutputDuplication]
        │
-       │  AcquireNextFrame() → staging_texture → Map() → BGRA バイト列
+       │  AcquireNextFrame() → staging texture → Map() → BGRA bytes
        ▼
 [FrameBuffer (BGRA)]
        │
-       │  push (非ブロッキング、満杯なら drop)
+       │  push (non-blocking; the oldest frame is dropped when the queue is full)
        ▼
-[有界キュー (max=4)]
+[bounded queue (max=4)]
        │
-       │  pop (エンコードスレッド)
+       │  pop (pipeline thread)
        ▼
 [sws_scale: BGRA → YUV420P/NV12]
        │
@@ -104,119 +107,124 @@ screen-relay は、Windows の DXGI Desktop Duplication API を使用して複�
 [RTSP RTP/TCP → MediaMTX]
 ```
 
+When the preferred codec is NVENC and the capture backend reports zero-copy support (physical resolution equals logical resolution, so no scaling), `EncoderController` tries to set up a GPU zero-copy path through a D3D11VA hardware frame context. If it succeeds, the captured texture goes straight to NVENC and the CPU readback and `sws_scale` steps are skipped; otherwise the CPU path above is used.
+
+DXGI only delivers a frame when the screen changes, so the pipeline re-encodes the last frame at the configured `fps` (a "freeze frame") to keep the stream alive.
+
 ---
 
-## スレッドモデル
+## Thread model
 
 ```text
-メインスレッド (MonitorSupervisor::run)
+Main thread (MonitorSupervisor::run)
 │
-├── monitor_poll_loop スレッド
-│   └── 1秒ごとにモニター変更（追加・削除・解像度変更）を検出
-│       → ScreenPipeline の追加・停止・再設定
+├── monitor_poll_loop thread
+│   └── Every monitor_check_interval_ms, detects monitor changes
+│       (added / removed / resolution / primary change) and FATAL pipelines
+│       → starts, stops or recreates ScreenPipelines
 │
-├── metrics_writer_loop スレッド
-│   └── 1秒ごとに health.json / metrics.json を書き出し
+├── metrics_writer_loop thread
+│   └── Writes health.json / metrics.json every emit_metrics_interval_ms
 │
-└── [モニターごとに]
-    ScreenPipeline::run スレッド
+├── AudioPipeline threads (only when audio.enabled)
+│
+└── [per monitor]
+    ScreenPipeline::pipeline_thread_func
     │
-    ├── ステートマシンループ
-    │   └── 各状態ハンドラーが同期的に処理
+    ├── State machine loop
+    │   └── Each state handler runs synchronously
     │
-    └── キャプチャスレッド (FramePump)
-        └── DxgiCaptureBackend::acquire_frame() をポーリング
-            → FrameBuffer をキューへ push
+    └── Capture thread (FramePump)
+        └── Polls DxgiCaptureBackend::acquire_frame()
+            → pushes FrameBuffers into the queue
 ```
 
 ---
 
-## エンコーダーフォールバック
+## Encoder fallback
 
-コーデックは設定の `codec` → `fallback_codecs` の順に試行します。`avcodec_open2()` が失敗した場合は次のコーデックへフォールバックします。
+Codecs are tried in the order `codec` → `fallback_codecs` from the config. If `avcodec_open2()` fails, the next codec is tried.
 
 ```text
 avcodec_find_encoder("h264_nvenc")
       │
-      ├── 成功 → avcodec_open2() → 成功 → NVENC 使用
-      │                          └── 失敗 → 次へ
-      └── 失敗 → avcodec_find_encoder("h264_mf")
+      ├── found → avcodec_open2() → success → NVENC used
+      │                           └── failure → next
+      └── not found → avcodec_find_encoder("h264_mf")
                         │
-                        ├── 成功 → avcodec_open2() → 成功 → h264_mf 使用
-                        │                          └── 失敗 → 次へ
-                        └── 失敗 → avcodec_find_encoder("libx264")
+                        ├── found → avcodec_open2() → success → h264_mf used
+                        │                           └── failure → next
+                        └── not found → avcodec_find_encoder("libx264")
                                           │
-                                          └── avcodec_open2() → libx264 使用
+                                          └── avcodec_open2() → libx264 used
 ```
 
-全コーデックの試行に失敗した場合、パイプラインは `FATAL` 状態に遷移します。
+If every codec fails, the pipeline transitions to `FATAL` (see [state-machine.md](./state-machine.md)).
 
 ---
 
-## プライマリモニターの二重配信
+## Primary monitor dual publishing
 
-プライマリモニター（`MONITORINFOF_PRIMARY` フラグが立つモニター）は 2 本の `RtspPublisherClient` を持ちます。
+The primary monitor (the one with the `MONITORINFOF_PRIMARY` flag) owns two `RtspPublisherClient` instances.
 
 ```text
 ScreenPipeline (primary=true)
-├── RtspPublisherClient → rtsp://host:8554/screen2   (例: \\.\DISPLAY2 がプライマリの場合)
-└── RtspPublisherClient → rtsp://host:8554/screen0   (プライマリエイリアス)
+├── RtspPublisherClient → rtsp://host:8554/screen2   (example: when \\.\DISPLAY2 is the primary)
+└── RtspPublisherClient → rtsp://host:8554/screen0   (primary alias)
 ```
 
-これにより `/screen0` でプライマリモニターの映像を常に受信できます。モニター番号を意識せずにプライマリ映像を参照したいクライアントはこの URL を使用してください。
+`/screen0` therefore always carries the primary monitor. Clients that want the primary monitor without knowing its number should use this URL.
 
-**プライマリ切替時の追従**: モニター電源断・切断などでプライマリが別モニターへ移った場合、
-`MonitorSupervisor::apply_monitor_changes()` が `is_primary` の変化を検知して影響するパイプラインを
-再生成します。`monitor_check_interval_ms`（デフォルト 1 秒）以内に `/screen0` が新プライマリへ追従します。
+**Following a primary switch**: if the primary moves to another monitor (power-off, disconnect, settings change), `MonitorSupervisor::apply_monitor_changes()` detects the `is_primary` change and recreates the affected pipelines. `/screen0` follows the new primary within `monitor_check_interval_ms` (default 1 second).
 
 ---
 
-## 音声パイプライン（`audio.enabled: true` の場合）
+## Audio pipeline (when `audio.enabled: true`)
 
-`audio.enabled` が有効な場合、`MonitorSupervisor` は **モニター数に関係なく単一の** `AudioPipeline` インスタンスを生成し、`WasapiAudioCapture` → `AudioEncoderController`（AAC）のキャプチャ・エンコードをバックグラウンドスレッドで実行します。エンコード済みパケットは購読中の全 `ScreenPipeline` へブロードキャストされ、各モニターの RTSP ストリーム（`/screen1`, `/screen2`, ... `/screen0` 含む）に同一の音声として配信されます。
+When `audio.enabled` is set, `MonitorSupervisor` creates a **single** `AudioPipeline` regardless of the number of monitors. It runs `WasapiAudioCapture` → `AudioEncoderController` (AAC) on background threads. Encoded packets are broadcast to every subscribed `ScreenPipeline` and published as the same audio on each monitor's RTSP streams (`/screen1`, `/screen2`, … including `/screen0`).
 
 ```text
 ┌───────────────────────────────────────────────┐
-│  AudioPipeline (単一インスタンス、モニター非依存)   │
+│  AudioPipeline (single instance, shared)       │
 │  WasapiAudioCapture → AudioEncoderController   │
 │  (WASAPI PCM)          (FFmpeg AAC)            │
 └───────────────────────┬───────────────────────┘
-                         │ ブロードキャスト
+                         │ broadcast
         ┌────────────────┼────────────────┐
         ▼                ▼                ▼
 AudioSubscriberQueue  AudioSubscriberQueue  ...
         │                │
         ▼                ▼
 ScreenPipeline(1)    ScreenPipeline(2)   ...
-  └ RtspPublisherClient (映像+音声)
+  └ RtspPublisherClient (video + audio)
 ```
 
-### 音声 pts の再計算
+### Audio pts recalculation
 
-音声パイプラインは全モニターで共有されるため、`EncodedPacket` には単一基準の pts ではなく `capture_timestamp_us`（絶対キャプチャ時刻、UNIX エポック起点）が設定されます。各 `ScreenPipeline` は自身の RTSP 接続開始時刻（`connect_wallclock_us`、映像の `start_time_realtime` と同一の基準）を用いて、送信直前に `capture_timestamp_us` から接続固有の pts を再計算します。これにより、RTCP SR の NTP-RTP 対応が映像・音声で一貫します。
+Because the audio pipeline is shared by all monitors, `EncodedPacket` carries `capture_timestamp_us` (absolute capture time, UNIX epoch) instead of a pts relative to a single stream. Each `ScreenPipeline` recomputes a connection-specific pts from `capture_timestamp_us` just before sending, using its own RTSP connection start time (`connect_wallclock_us`, the same base as the video `start_time_realtime`). This keeps the RTCP SR NTP-to-RTP mapping consistent between video and audio.
 
-### 障害時の扱い
+### Failure handling
 
-- 音声デバイスの取得・AAC エンコーダーの初期化に失敗した場合、`MonitorSupervisor::init()` はエラーをログに記録し、音声なしで映像配信を継続します
-- 音声キャプチャデバイスが失われた場合（デバイス切断等）、`AudioPipeline` は音声配信のみを停止します。映像パイプラインには影響しません
+- If the audio device cannot be opened or the AAC encoder fails to initialize, `MonitorSupervisor::init()` logs the error and continues with video only.
+- If the capture device is lost while running (for example, it is unplugged), `AudioPipeline` stops audio only. Video pipelines are unaffected.
 
 ---
 
-## 依存ライブラリ
+## Dependencies
 
-| ライブラリ | 用途 | 形式 |
+| Library | Purpose | Linking |
 |---|---|---|
-| FFmpeg (avcodec/avformat/swscale) | エンコード・RTSP 配信 | 動的リンク (.dll) |
-| nlohmann/json | 設定ファイルパース | ヘッダーオンリー |
-| spdlog | 構造化ログ | ヘッダーオンリー |
-| Direct3D 11 / DXGI | スクリーンキャプチャ | Windows システム |
+| FFmpeg (avcodec/avformat/avutil/swscale/swresample) | Encoding and RTSP publishing | Dynamic (.dll) |
+| nlohmann/json | Config parsing | Header-only (CMake `FetchContent`) |
+| spdlog | Structured logging | CMake `FetchContent` |
+| Direct3D 11 / DXGI / WASAPI | Screen and audio capture | Windows system libraries |
 
 ---
 
-## 既知の技術的制約
+## Known technical constraints
 
-- **RTSP トランスポート**: 現状 TCP のみ（UDP 非対応）
-- **ピクセルフォーマット**: DXGI は BGRA で出力する（RGBA ではない）。swscale で YUV に変換する際は `AV_PIX_FMT_BGRA` を指定すること
-- **キャプチャバックエンド**: 現在 DXGI のみ実装（WGC は未実装）。`ICaptureBackend` インターフェースを実装することで追加バックエンドを組み込み可能
-- **モニター番号**: デバイス名 `\\.\DISPLAYn` の `n` を使用。毎ポーリングで Windows 設定に追従する。パイプライン管理は CCD API (`monitorDevicePath`) による安定 ID でキーイングするため、番号変化（OS 再パック・プライマリ切替）でもパイプラインと物理モニターの対応が崩れない
-- **DRM コンテンツ**: Protected content（DRM）が有効な映像の含まれる画面は DXGI Desktop Duplication が失敗する場合がある
+- **RTSP transport**: TCP only (`rtsp_transport=tcp`); UDP is not supported.
+- **Pixel format**: DXGI outputs BGRA (not RGBA). Use `AV_PIX_FMT_BGRA` when converting to YUV with swscale.
+- **Capture backend**: only DXGI is implemented (no Windows Graphics Capture). Additional backends can be added by implementing the `ICaptureBackend` interface.
+- **Monitor numbers**: `n` in the device name `\\.\DISPLAYn` is used and re-read on every poll so it follows the Windows settings. Pipelines are keyed by a stable ID from the CCD API (`monitorDevicePath`), so the mapping between pipelines and physical monitors survives number changes (OS renumbering, primary switch).
+- **DRM content**: screens showing protected (DRM) content may cause DXGI Desktop Duplication to fail.

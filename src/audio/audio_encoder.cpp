@@ -12,36 +12,28 @@ extern "C" {
 #include <algorithm>
 #include <cstring>
 
-/**
- * @brief AudioEncoderController の内部実装
- *
- * FFmpeg の AAC コーデックコンテキスト・リサンプラー・音声 FIFO を保持する。
- */
+/** @brief FFmpeg AAC codec context, resampler and sample FIFO. */
 struct AudioEncoderController::Impl {
-    const AVCodec*  codec     = nullptr;  ///< AAC エンコーダー
-    AVCodecContext* codec_ctx = nullptr;  ///< コーデックコンテキスト
-    SwrContext*     swr_ctx   = nullptr;  ///< リサンプリングコンテキスト
-    AVAudioFifo*    fifo      = nullptr;  ///< エンコーダーのフレームサイズに合わせるための FIFO
-    AVPacket*       pkt       = nullptr;  ///< 再利用可能なパケット
-    AVFrame*        frame     = nullptr;  ///< 再利用可能な PCM フレームバッファ (drain_fifo_and_encode 用)
+    const AVCodec*  codec     = nullptr;  ///< AAC encoder
+    AVCodecContext* codec_ctx = nullptr;  ///< Codec context
+    SwrContext*     swr_ctx   = nullptr;  ///< Resampler context
+    AVAudioFifo*    fifo      = nullptr;  ///< Accumulates samples up to the encoder frame size
+    AVPacket*       pkt       = nullptr;  ///< Reusable packet
+    AVFrame*        frame     = nullptr;  ///< Reusable PCM frame (used by drain_fifo_and_encode)
 
-    int in_sample_rate = 48000;  ///< 入力サンプルレート
-    int in_channels    = 2;      ///< 入力チャンネル数
-    AVSampleFormat in_sample_fmt = AV_SAMPLE_FMT_FLT;  ///< 入力サンプルフォーマット（インターリーブド）
+    int in_sample_rate = 48000;  ///< Input sample rate
+    int in_channels    = 2;      ///< Input channel count
+    AVSampleFormat in_sample_fmt = AV_SAMPLE_FMT_FLT;  ///< Input sample format (interleaved)
 
-    int64_t samples_encoded = 0;  ///< 出力済みサンプル数（pts 計算用）
-    int64_t last_meta_us    = 0;  ///< 直近に FIFO へ投入したバッファのキャプチャ時刻
+    int64_t samples_encoded = 0;  ///< Samples submitted to the encoder (drives pts)
+    int64_t last_meta_us    = 0;  ///< Capture time of the most recent input buffer
 };
 
 AudioEncoderController::AudioEncoderController() : impl_(std::make_unique<Impl>()) {}
 
 AudioEncoderController::~AudioEncoderController() { reset(); }
 
-/**
- * @brief AAC エンコーダーがサポートするサンプルフォーマットから最適なものを選ぶ
- *
- * FLTP を優先し、なければコーデックの先頭フォーマットを返す。
- */
+// Prefers FLTP; otherwise falls back to the codec's first supported format.
 static AVSampleFormat pick_sample_fmt(const AVCodec* codec) {
     const AVSampleFormat* fmts = nullptr;
 #if LIBAVCODEC_VERSION_INT >= AV_VERSION_INT(61, 0, 0)
@@ -63,8 +55,8 @@ bool AudioEncoderController::init(const AudioConfig& config, int in_sample_rate,
 
     impl_->in_sample_rate = in_sample_rate;
     impl_->in_channels    = in_channels;
-    // WASAPI 共有モードのミックスフォーマットは通常 IEEE float32。
-    // それ以外の場合（一部の録音デバイス）は int16 PCM を仮定する。
+    // WASAPI shared-mode mix formats are normally IEEE float32; anything else
+    // (some capture devices) is assumed to be int16 PCM.
     impl_->in_sample_fmt  = in_is_float ? AV_SAMPLE_FMT_FLT : AV_SAMPLE_FMT_S16;
 
     impl_->codec = avcodec_find_encoder(AV_CODEC_ID_AAC);
@@ -94,7 +86,7 @@ bool AudioEncoderController::init(const AudioConfig& config, int in_sample_rate,
         return false;
     }
 
-    // --- リサンプラー: 入力 PCM → エンコーダーの要求フォーマットへ変換する ---
+    // Resampler: input PCM -> the encoder's required format.
     AVChannelLayout in_layout;
     av_channel_layout_default(&in_layout, impl_->in_channels);
 
@@ -130,8 +122,8 @@ bool AudioEncoderController::init(const AudioConfig& config, int in_sample_rate,
         return false;
     }
 
-    // drain_fifo_and_encode() で毎回 alloc/free せず使い回すためのフレーム。
-    // frame_size はエンコーダー確定後の固定値のため、バッファも一度だけ確保する。
+    // Frame reused by drain_fifo_and_encode() to avoid per-call alloc/free;
+    // frame_size is fixed once the encoder is open, so allocate the buffer once.
     const int frame_size = ctx->frame_size > 0 ? ctx->frame_size : 1024;
     impl_->frame = av_frame_alloc();
     if (!impl_->frame) {
@@ -153,9 +145,7 @@ bool AudioEncoderController::init(const AudioConfig& config, int in_sample_rate,
     return true;
 }
 
-/**
- * @brief FIFO からフレームサイズ分だけ取り出してエンコードする
- */
+// Encodes every full encoder frame currently held in the FIFO.
 bool drain_fifo_and_encode(AudioEncoderController::Impl* impl,
                             std::vector<EncodedPacket>& out_packets) {
     AVCodecContext* ctx = impl->codec_ctx;
@@ -164,9 +154,9 @@ bool drain_fifo_and_encode(AudioEncoderController::Impl* impl,
     while (av_audio_fifo_size(impl->fifo) >= frame_size) {
         AVFrame* frame = impl->frame;
 
-        // avcodec_send_frame() が内部でバッファの参照を保持し続けることがあるため、
-        // 上書き前に make_writable で書き込み可能な状態に戻す
-        // （既存参照がなければコピーなしで再利用される）。
+        // The encoder may still hold a reference to the frame buffer after
+        // avcodec_send_frame(); make it writable before overwriting (no copy if
+        // there is no other reference).
         if (av_frame_make_writable(frame) < 0) return false;
 
         if (av_audio_fifo_read(impl->fifo, reinterpret_cast<void**>(frame->data),
@@ -190,7 +180,7 @@ bool drain_fifo_and_encode(AudioEncoderController::Impl* impl,
             ep.pts               = impl->pkt->pts;
             ep.dts               = impl->pkt->pts;
             ep.duration          = frame_size;
-            ep.is_key_frame      = true;  // AAC は全フレームが独立デコード可能
+            ep.is_key_frame      = true;  // every AAC frame is independently decodable
             ep.time_base_num     = 1;
             ep.time_base_den     = ctx->sample_rate;
             ep.capture_timestamp_us = impl->last_meta_us;
@@ -206,8 +196,8 @@ bool AudioEncoderController::encode(const AudioBuffer& buf, const AudioMeta& met
     if (!impl_->codec_ctx || !impl_->swr_ctx || !impl_->fifo) return false;
     if (buf.frame_count == 0) return true;
 
-    // buf.data が frame_count から期待されるバイト数に満たない場合、swr_convert に
-    // 渡すと範囲外読み出しになる。キャプチャ側の不整合を検出して安全側に倒す。
+    // A buf.data shorter than frame_count implies would cause an out-of-bounds
+    // read in swr_convert; reject inconsistent capture buffers.
     const int in_bytes_per_sample =
         av_get_bytes_per_sample(impl_->in_sample_fmt);
     const size_t expected_bytes =
@@ -222,10 +212,10 @@ bool AudioEncoderController::encode(const AudioBuffer& buf, const AudioMeta& met
 
     AVCodecContext* ctx = impl_->codec_ctx;
 
-    // 入力 PCM はインターリーブドのため、swr_convert には単一プレーンとして渡す
+    // Interleaved PCM is passed to swr_convert as a single plane
     const uint8_t* in_data[1] = { buf.data.data() };
 
-    // リサンプル後の最大サンプル数を見積もり、出力バッファを確保する
+    // Upper bound on resampled output samples (includes the resampler's buffered delay)
     int64_t max_out_samples = av_rescale_rnd(
         swr_get_delay(impl_->swr_ctx, impl_->in_sample_rate) + buf.frame_count,
         ctx->sample_rate, impl_->in_sample_rate, AV_ROUND_UP);

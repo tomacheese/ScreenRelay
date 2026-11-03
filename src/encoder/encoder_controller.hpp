@@ -8,200 +8,165 @@
 #include <cstdint>
 
 /**
- * @brief FFmpeg H.264 エンコーダーのコントローラー
+ * @brief FFmpeg H.264 encoder controller.
  *
- * h264_nvenc → h264_mf → libx264 の順でフォールバックを試みる。
- * 入力フレームフォーマットは BGRA を前提とする。
+ * Tries config.codec, then config.fallback_codecs in order.
+ * Input frames are assumed to be BGRA.
  */
 class EncoderController {
 public:
-    /** @brief コンストラクタ */
+    /** Does not open an encoder; see init(). */
     EncoderController();
 
-    /** @brief デストラクタ。reset() を呼び出してリソースを解放する */
     ~EncoderController();
 
     /**
-     * @brief エンコーダーを初期化する
+     * @brief Initializes the encoder.
      *
-     * config.codec を優先コーデックとして試し、失敗した場合は
-     * config.fallback_codecs の順でフォールバックを試みる。
+     * Tries config.codec first, then config.fallback_codecs in order.
      *
-     * shared_d3d11_device が指定され、かつ優先コーデックが NVENC である場合、
-     * まず GPU ゼロコピーパス（D3D11VA ハードウェアフレームコンテキスト経由で
-     * BGRA テクスチャを直接 NVENC に渡す方式）の確立を試みる。これにより
-     * CPU 側での色空間変換 (sws_scale) とテクスチャ読み戻し (Map/memcpy) を
-     * 完全に回避できる。失敗した場合は通常の CPU パスにフォールバックする。
+     * If shared_d3d11_device is given and the codec is NVENC, first tries to
+     * establish the GPU zero-copy path (BGRA textures passed straight to NVENC
+     * through a D3D11VA hardware frames context), which avoids CPU color
+     * conversion (sws_scale) and texture readback (Map/memcpy). On failure,
+     * falls back to the CPU path.
      *
-     * @param config              エンコーダー設定
-     * @param width               フレーム幅 (px)
-     * @param height              フレーム高さ (px)
-     * @param error               エラーメッセージ出力先
-     * @param shared_d3d11_device GPU ゼロコピーパスで共有する ID3D11Device* (型消去)。
-     *                            nullptr の場合は CPU パスのみを使用する
-     * @return 成功した場合 true
+     * @param config              Encoder settings
+     * @param width               Frame width (px)
+     * @param height              Frame height (px)
+     * @param error               Error message output
+     * @param shared_d3d11_device Type-erased ID3D11Device* shared for the zero-copy
+     *                            path; nullptr means CPU path only
+     * @return true on success
      */
     bool init(const EncoderConfig& config, uint32_t width, uint32_t height,
               std::string& error, void* shared_d3d11_device = nullptr);
 
     /**
-     * @brief GPU ゼロコピーパスが有効かどうかを返す
+     * @brief Returns whether the GPU zero-copy path is active.
      *
-     * init() が GPU ハードウェアフレームコンテキスト経由での
-     * エンコーダー初期化に成功した場合に true を返す。
-     * true の場合、encode() に渡す FrameBuffer に gpu_texture が
-     * 設定されていれば、CPU 変換を介さないゼロコピーパスが使用される。
-     *
-     * @return GPU ゼロコピーパスが有効なら true
+     * True if init() succeeded through the GPU hardware frames context.
      */
     bool is_gpu_zero_copy_active() const;
 
     /**
-     * @brief BGRA フレームをエンコードする
+     * @brief Encodes a BGRA frame.
      *
-     * @param frame           BGRA フレームバッファ
-     * @param meta            フレームメタデータ
-     * @param out_packets     エンコード済みパケットの出力先
-     * @param content_changed 直前に encode() したフレームからピクセル内容が
-     *                        変化している場合は true。false を渡すと
-     *                        sws_scale による BGRA→YUV 変換を省略し、
-     *                        直前の変換結果（YUV フレーム）を再利用する。
-     *                        静止画面のフリーズフレーム再送時に
-     *                        CPU 負荷（色空間変換コスト）を大幅に削減できる。
-     *                        省略した場合は true 扱い（常に変換する）。
-     *                        GPU ゼロコピーパス使用時は GPU 側コピーが
-     *                        十分に高速なため、このフラグに関わらず
-     *                        毎フレームコピーを実行する。
+     * @param frame           BGRA frame buffer
+     * @param meta            Frame metadata
+     * @param out_packets     Receives the encoded packets
+     * @param content_changed true if the pixels differ from the previously
+     *                        encoded frame. With false, the sws_scale BGRA->YUV
+     *                        conversion is skipped and the previous YUV frame
+     *                        is reused, which greatly cuts CPU load when
+     *                        resending freeze frames of a static screen.
+     *                        Defaults to true (always convert). Ignored on the
+     *                        GPU zero-copy path, where the GPU copy is cheap
+     *                        enough to run every frame.
      *
-     * is_gpu_zero_copy_active() が true の場合は、frame.gpu_texture の有無に
-     * 関わらず常に GPU ゼロコピーパスを使用する。
-     * - frame.gpu_texture が設定されている場合: GPU 内コピー (CopySubresourceRegion)
-     * - frame.gpu_texture が未設定で frame.data がある場合: CPU→GPU アップロード
-     *   (UpdateSubresource)。接続直後のゼロコピーモード切り替え前に取得した
-     *   過渡的な CPU フレームに対応し、アイドルモニターでの映像断を防ぐ。
-     * is_gpu_zero_copy_active() が false の場合は frame.data を BGRA バッファと
-     * して扱い、sws_scale で変換してからエンコードする（CPU パス）。
+     * If is_gpu_zero_copy_active() is true, the zero-copy path is always used,
+     * whether or not frame.gpu_texture is set:
+     * - gpu_texture set: GPU-side copy (CopySubresourceRegion)
+     * - gpu_texture unset but frame.data present: CPU->GPU upload
+     *   (UpdateSubresource). Covers the transitional CPU frame captured before
+     *   the switch to zero-copy mode just after connecting, avoiding a video
+     *   gap on idle monitors.
+     * Otherwise frame.data is treated as a BGRA buffer and converted with
+     * sws_scale before encoding (CPU path).
      *
-     * @return 成功した場合 true
+     * @return true on success
      */
     bool encode(const FrameBuffer& frame, const FrameMeta& meta,
                 std::vector<EncodedPacket>& out_packets,
                 bool content_changed = true);
 
     /**
-     * @brief エンコーダーをフラッシュする
-     *
-     * ストリーム終端で残留フレームを取り出す際に使用する。
-     *
-     * @param out_packets フラッシュ済みパケットの出力先
-     * @return 成功した場合 true
+     * @brief Flushes the encoder, draining buffered frames at end of stream.
+     * @param out_packets Receives the flushed packets
+     * @return true on success
      */
     bool flush(std::vector<EncodedPacket>& out_packets);
 
-    /**
-     * @brief エンコーダーをリセットしてリソースを解放する
-     *
-     * init() を再度呼び出すことで再初期化できる。
-     */
+    /** Frees all resources; call init() again to reuse. */
     void reset();
 
-    /** @brief フレーム幅 (px) を返す */
     uint32_t width()  const { return width_; }
 
-    /** @brief フレーム高さ (px) を返す */
     uint32_t height() const { return height_; }
 
-    /**
-     * @brief フレームレートを返す
-     * @return 設定された fps 値
-     */
     int fps() const;
 
-    /**
-     * @brief ビットレートを返す
-     * @return 設定された bitrate_kbps 値
-     */
+    /** @brief Configured bitrate_kbps */
     int bitrate_kbps() const;
 
-    /**
-     * @brief RTSP ストリーム初期化用のコーデック情報
-     *
-     * RtspPublisherClient::connect() に渡すために使用する。
-     */
+    /** @brief Codec info for initializing the RTSP stream (passed to RtspPublisherClient::connect()). */
     struct CodecInfo {
-        int codec_id      = 0;   ///< AVCodecID の値
-        int width         = 0;   ///< フレーム幅 (px)
-        int height        = 0;   ///< フレーム高さ (px)
-        int fps           = 60;  ///< フレームレート
-        int bit_rate      = 0;   ///< ビットレート (bps)
-        int time_base_num = 1;   ///< タイムベース分子
-        int time_base_den = 60;  ///< タイムベース分母
-        std::vector<uint8_t> extradata;   ///< SPS/PPS などのエクストラデータ
-        /** @brief RTCP SR の NTP 基点となる壁時計時刻 (μs, UNIX エポック起点)。
-         *  0 の場合は接続時に av_gettime() で自動設定される。
-         *  再接続時は最初のフレームの時刻を指定して RTCP SR の整合性を保つ。 */
+        int codec_id      = 0;   ///< AVCodecID value
+        int width         = 0;   ///< Frame width (px)
+        int height        = 0;   ///< Frame height (px)
+        int fps           = 60;  ///< Frame rate
+        int bit_rate      = 0;   ///< Bit rate (bps)
+        int time_base_num = 1;   ///< Time base numerator
+        int time_base_den = 60;  ///< Time base denominator
+        std::vector<uint8_t> extradata;   ///< Extra data such as SPS/PPS
+        /** @brief Wall-clock time (us, UNIX epoch) used as the RTCP SR NTP base.
+         *  0 means it is set from av_gettime() at connect time.
+         *  On reconnect, pass the first frame's time to keep RTCP SR consistent. */
         int64_t stream_start_us = 0;
     };
 
-    /**
-     * @brief コーデック情報を取得する
-     * @return エンコーダーのコーデック情報
-     */
+    /** @brief Returns the encoder's codec info (default-initialized before init()). */
     CodecInfo get_codec_info() const;
 
     /**
-     * @brief 実際に選択されたコーデック名を返す
+     * @brief Returns the codec actually opened.
      *
-     * フォールバックが発生した場合、config.codec ではなく
-     * 実際に avcodec_open2() に成功したコーデック名を返す。
-     * init() 前は空文字列を返す。
-     *
-     * @return 選択されたコーデック名
+     * After a fallback this is the codec whose avcodec_open2() succeeded, not
+     * config.codec. Empty before init().
      */
     const std::string& selected_codec_name() const;
 
     /**
-     * @brief 最初のフレームの壁時計時刻を返す
+     * @brief Returns the wall-clock time of the first frame.
      *
-     * RTSP 再接続時に start_time_realtime を正しく設定するために使用する。
-     * まだフレームを受け取っていない場合は 0 を返す。
+     * Used to set start_time_realtime correctly on RTSP reconnect.
      *
-     * @return μs 単位の時刻 (UNIX エポック起点)。未設定時は 0
+     * @return Time in us (UNIX epoch); 0 if no frame has been encoded yet
      */
     int64_t first_frame_time_us() const;
 
     /**
-     * @brief 次のフレームを IDR (キーフレーム) として強制出力するよう要求する
+     * @brief Requests that the next frame be encoded as an IDR (key frame).
      *
-     * RTSP 再接続後に呼び出すことで、接続直後から受信側が完全な映像を
-     * 表示できるようにする。エンコーダーをリセットせず GOP 内に IDR を
-     * 挿入するため、PTS の連続性（RTCP SR との整合性）は保たれる。
-     * 一度消費されると次の encode() 呼び出しでフラグはリセットされる。
+     * Call after an RTSP reconnect so the receiver can show full video right
+     * away. The IDR is inserted within the GOP without resetting the encoder,
+     * so PTS continuity (and RTCP SR consistency) is preserved. The request is
+     * consumed by the next encode() call.
      */
     void request_next_idr();
 
 private:
     /**
-     * @brief GPU ゼロコピーパスでフレームをエンコードする
+     * @brief Encodes a frame on the GPU zero-copy path.
      *
-     * frame.gpu_texture が参照する D3D11 テクスチャを、ハードウェアフレーム
-     * コンテキストのプールテクスチャへ GPU 内コピー (CopySubresourceRegion) し、
-     * そのまま avcodec_send_frame に渡す。CPU 側の色空間変換・メモリコピーは
-     * 一切発生しない。
+     * Copies the D3D11 texture referenced by frame.gpu_texture into a pool
+     * texture of the hardware frames context on the GPU (CopySubresourceRegion)
+     * and passes it to avcodec_send_frame, with no CPU color conversion or
+     * memory copy. A CPU-only frame (frame.data) is uploaded with UpdateSubresource.
      *
-     * @param frame       GPU テクスチャを保持する FrameBuffer
-     * @param meta        フレームメタデータ
-     * @param out_packets エンコード済みパケット出力先
-     * @return 成功した場合 true
+     * @param frame       Frame holding the GPU texture (or CPU data)
+     * @param meta        Frame metadata
+     * @param out_packets Receives the encoded packets
+     * @return true on success
      */
     bool encode_gpu_zero_copy(const FrameBuffer& frame, const FrameMeta& meta,
                               std::vector<EncodedPacket>& out_packets);
 
-    /** Pimpl による実装詳細の隠蔽 */
+    /** Pimpl */
     struct Impl;
     std::unique_ptr<Impl> impl_;
 
-    uint32_t width_  = 0;  ///< フレーム幅
-    uint32_t height_ = 0;  ///< フレーム高さ
-    EncoderConfig config_; ///< エンコーダー設定
+    uint32_t width_  = 0;  ///< Frame width
+    uint32_t height_ = 0;  ///< Frame height
+    EncoderConfig config_; ///< Encoder settings
 };

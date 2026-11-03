@@ -10,106 +10,78 @@
 #include <utility>
 
 /**
- * @brief バックグラウンドスレッドでフレームを取得し、境界キューに格納するクラス
+ * @brief Pulls frames from an ICaptureBackend on a background thread into a bounded queue.
  *
- * ICaptureBackend からフレームを継続的に取得し、内部キューに蓄積する。
- * コンシューマースレッドは try_pop / wait_pop でフレームを取り出す。
- * キューが MAX_QUEUE_SIZE を超えた場合は最古フレームを破棄する。
+ * Consumer threads take frames with try_pop / wait_pop. When the queue is
+ * full, the oldest frame is dropped.
  */
 class FramePump {
 public:
-    /**
-     * @brief コンストラクタ
-     *
-     * スレッドは start() 呼び出し時に開始する。
-     */
+    /** Does not start the thread; see start(). */
     FramePump();
 
-    /**
-     * @brief デストラクタ
-     *
-     * 実行中の場合は stop() を呼び出してスレッドを結合する。
-     */
+    /** Calls stop() (joins the thread) if still running. */
     ~FramePump();
 
     /**
-     * @brief キャプチャを開始する
+     * @brief Starts the capture thread. No-op if already running.
      *
-     * バックグラウンドスレッドを起動して backend からフレームの取得を開始する。
-     * 既に実行中の場合は何もしない。
-     *
-     * @param backend          キャプチャバックエンド (所有権なし。呼び出し元が管理する)
-     * @param frame_timeout_ms フレーム取得タイムアウト (ms)
+     * @param backend          Capture backend (not owned; the caller manages its lifetime)
+     * @param frame_timeout_ms Per-frame acquire timeout (ms)
      */
     void start(ICaptureBackend* backend, int frame_timeout_ms);
 
-    /**
-     * @brief キャプチャを停止し、スレッドを結合する
-     *
-     * 既に停止している場合は何もしない。
-     */
+    /** Stops capture and joins the thread. No-op if already stopped. */
     void stop();
 
     /**
-     * @brief フレームをノンブロッキングで取得する
+     * @brief Non-blocking frame retrieval.
      *
-     * キューにフレームがある場合のみ buf と meta に書き込んで true を返す。
-     * キューが空の場合は即座に false を返す。
-     *
-     * @param[out] buf   取得したフレームバッファ
-     * @param[out] meta  取得したフレームメタデータ
-     * @return キューからフレームを取得できた場合 true
+     * @param[out] buf   Frame buffer
+     * @param[out] meta  Frame metadata
+     * @return true if a frame was taken from the queue
      */
     bool try_pop(FrameBuffer& buf, FrameMeta& meta);
 
     /**
-     * @brief フレームをタイムアウト付きで取得する
+     * @brief Waits up to timeout_ms for a frame.
      *
-     * キューにフレームが到着するまで最大 timeout_ms ミリ秒待機する。
+     * Returns early (false) if the pump stops or the backend reports a hard error.
      *
-     * @param[out] buf        取得したフレームバッファ
-     * @param[out] meta       取得したフレームメタデータ
-     * @param      timeout_ms タイムアウト (ms)
-     * @return フレームを取得できた場合 true、タイムアウトなら false
+     * @param[out] buf        Frame buffer
+     * @param[out] meta       Frame metadata
+     * @param      timeout_ms Timeout (ms)
+     * @return true if a frame was taken, false on timeout/stop/error
      */
     bool wait_pop(FrameBuffer& buf, FrameMeta& meta, int timeout_ms);
 
-    /**
-     * @brief キャプチャスレッドが実行中かどうかを返す
-     * @return 実行中なら true
-     */
+    /** @return true while the capture thread is running */
     bool is_running() const { return running_.load(); }
 
     /**
-     * @brief バックエンドでハードエラー（ACCESS_LOST 等）が発生しているか返す
+     * @brief Returns whether the backend reports a hard error (e.g. ACCESS_LOST).
      *
-     * true の場合はキャプチャの再初期化が必要。
-     *
-     * @return ハードエラーが発生していれば true
+     * When true, capture must be re-initialized.
      */
     bool has_backend_error() const {
         return backend_ && backend_->has_hard_error();
     }
 
 private:
-    /**
-     * @brief バックグラウンドキャプチャスレッドのエントリポイント
-     *
-     * running_ が false になるまでフレームを取得し続ける。
-     */
+    /** Capture thread entry point; loops until running_ becomes false. */
     void capture_thread_func();
 
-    /** キューの最大サイズ。超過した場合は最古フレームを破棄する */
+    /** Maximum queue size; the oldest frame is dropped when full. */
     static constexpr int MAX_QUEUE_SIZE = 4;
 
-    ICaptureBackend* backend_        = nullptr;   ///< キャプチャバックエンド (所有権なし)
-    int              frame_timeout_ms_ = 100;     ///< フレーム取得タイムアウト (ms)
+    ICaptureBackend* backend_        = nullptr;   ///< Not owned
+    int              frame_timeout_ms_ = 100;     ///< Frame acquire timeout (ms)
 
-    std::atomic<bool>    running_{false};          ///< スレッド実行フラグ
-    std::atomic<bool>    backend_hard_error_{false};  ///< バックエンドハードエラーフラグ (wait_pop 短絡用)
-    mutable std::mutex   mutex_;                   ///< キュー保護ミューテックス
-    std::condition_variable cv_;                   ///< フレーム到着通知用条件変数
-    std::queue<std::pair<FrameBuffer, FrameMeta>> queue_;  ///< フレームキュー
-    std::thread thread_;                           ///< バックグラウンドキャプチャスレッド
-    uint64_t    frame_seq_ = 0;                    ///< フレームシーケンスカウンター
+    std::atomic<bool>    running_{false};          ///< Thread run flag
+    std::atomic<bool>    backend_hard_error_{false};  ///< Backend hard error (lets wait_pop return early)
+    mutable std::mutex   mutex_;                   ///< Guards queue_
+    std::condition_variable cv_;                   ///< Signals frame arrival
+    std::queue<std::pair<FrameBuffer, FrameMeta>> queue_;  ///< Frame queue
+    std::thread thread_;                           ///< Capture thread
+    uint64_t    frame_seq_ = 0;                    ///< Frame sequence counter (capture thread only; reset in start())
 };

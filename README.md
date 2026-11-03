@@ -4,7 +4,7 @@ A Windows application that captures all connected monitors via the DXGI Desktop 
 
 ## Features
 
-- **Multi-monitor capture** — each display gets its own RTSP stream (`/screen1`, `/screen2`, …)
+- **Multi-monitor capture** — each display gets its own RTSP stream (`/screen1`, `/screen2`, …) (with `rtsp.path_pattern` set to `/screen{n}` as in the example config; the built-in default is `/live/screen{n}`)
 - **Primary monitor alias** — `/screen0` always points to the primary monitor
 - **Hardware H.264 encoding** — prefers NVIDIA NVENC; falls back to `h264_mf` (Windows Media Foundation) then `libx264`
 - **Dynamic monitor detection** — handles monitor connect/disconnect and resolution changes at runtime without restart
@@ -37,7 +37,7 @@ A Windows application that captures all connected monitors via the DXGI Desktop 
 
 ### 1. Download from Releases
 
-1. Open the [latest release](https://github.com/tomacheese/screen-relay/releases/latest)
+1. Open the [latest release](https://github.com/tomacheese/ScreenRelay/releases/latest)
 2. Download `screen-relay-vX.Y.Z-win64.zip`
 3. Extract the zip to any folder (e.g. `C:\Tools\screen-relay\`)
 
@@ -45,7 +45,7 @@ The extracted folder contains:
 
 - `screen-relay.exe` — the main executable
 - `*.dll` — FFmpeg LGPL shared libraries (must stay in the same folder)
-- `config.example.json` — annotated configuration template
+- `config.example.json` — configuration template
 - `README.md`
 
 ### 2. Create your config
@@ -127,7 +127,7 @@ The process responds to `Ctrl+C` / `CTRL_CLOSE_EVENT` for graceful shutdown.
 
 ## Configuration
 
-See [`config/config.example.json`](config/config.example.json) for a fully-annotated example.
+See [`config/config.example.json`](config/config.example.json) for a full example.
 Full reference: [`docs/configuration.md`](docs/configuration.md)
 
 ### Minimum viable config
@@ -149,6 +149,7 @@ Full reference: [`docs/configuration.md`](docs/configuration.md)
 screen-relay/
 ├── src/
 │   ├── app/          # MonitorSupervisor + ScreenPipeline + StateMachine
+│   ├── audio/        # WASAPI capture, AAC encoder, shared AudioPipeline
 │   ├── capture/      # ICaptureBackend, DxgiCaptureBackend, FramePump
 │   ├── common/       # Types, error codes, time utilities
 │   ├── config/       # JSON config loader
@@ -162,7 +163,7 @@ screen-relay/
 ├── config/
 │   ├── config.example.json
 │   └── config.json   # (gitignored, your local config)
-└── docs/             # Category-specific documentation (Japanese)
+└── docs/             # Category-specific documentation
 ```
 
 ## Documentation
@@ -175,12 +176,15 @@ screen-relay/
 | [docs/state-machine.md](docs/state-machine.md) | State machine: states, transitions, error handling |
 | [docs/metrics.md](docs/metrics.md) | Metrics/health JSON format, event log format |
 | [docs/troubleshooting.md](docs/troubleshooting.md) | Common errors and solutions |
+| [docs/design.md](docs/design.md) | Design notes and rationale |
 
-> All docs are written in Japanese. See [README-ja.md](README-ja.md) for the Japanese README.
+A Japanese translation of this README is available as [README-ja.md](README-ja.md).
 
 ## Running Tests
 
 ```powershell
+# The FFmpeg DLLs must be on PATH (or next to the exe)
+$env:PATH = "$PWD\deps\ffmpeg\bin;$env:PATH"
 build/tests/screen_relay_tests.exe
 # Expected output ends with: All tests passed.
 ```

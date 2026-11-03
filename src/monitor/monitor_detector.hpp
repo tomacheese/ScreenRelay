@@ -5,50 +5,45 @@
 #include <string>
 #include <vector>
 
-/**
- * @brief 検出済みモニターの情報
- *
- * EnumDisplayMonitors で列挙したモニターの識別子・解像度・プライマリ判定などを保持する。
- */
+/** @brief Information about a detected monitor (as enumerated by EnumDisplayMonitors). */
 struct MonitorInfo {
     HMONITOR handle         = nullptr;
-    int      number         = 0;          ///< \\.\DISPLAYn の n（Windows 設定ディスプレイ番号）
-    int      logical_width  = 0;          ///< 論理解像度の幅 (DPI スケーリング後)
-    int      logical_height = 0;          ///< 論理解像度の高さ (DPI スケーリング後)
-    bool     is_primary     = false;      ///< プライマリモニターなら true
-    std::string device_name;              ///< デバイス名 (例: "\\.\DISPLAY2")
-    std::string stable_id;               ///< 物理モニター単位で安定な ID
-                                          ///<   CCD API の monitorDevicePath（例:
-                                          ///<   "\\\\?\\DISPLAY#DELA0BC#...#{...}"）。
-                                          ///<   CCD 取得失敗時は device_name にフォールバック。
-                                          ///<   パイプライン管理のキーとして使用する。
+    int      number         = 0;          ///< The n in \\.\DISPLAYn
+    int      logical_width  = 0;          ///< Logical width (after DPI scaling)
+    int      logical_height = 0;          ///< Logical height (after DPI scaling)
+    bool     is_primary     = false;      ///< true for the primary monitor
+    std::string device_name;              ///< Device name (e.g. "\\.\DISPLAY2")
+    std::string stable_id;               ///< ID stable per physical monitor: the CCD API
+                                          ///<   monitorDevicePath (e.g.
+                                          ///<   "\\\\?\\DISPLAY#DELA0BC#...#{...}").
+                                          ///<   Falls back to device_name if CCD lookup fails.
+                                          ///<   Used as the pipeline management key.
 };
 
 /**
- * @brief モニターの列挙と変更検知を行うクラス
+ * @brief Enumerates connected monitors, excluding mirroring drivers.
  *
- * Windows の EnumDisplayMonitors / EnumDisplayDevices を使用して、
- * 接続中のモニター一覧を取得し、ミラーリングドライバーを除外する。
+ * Uses EnumDisplayMonitors / EnumDisplayDevices.
  */
 class MonitorDetector {
 public:
     /**
-     * @brief 現在接続されている (ミラーを除く) モニターを列挙する
-     * @return 検出されたモニターの一覧
+     * @brief Enumerates currently connected monitors (excluding mirrors).
+     * @return The detected monitors
      */
     static std::vector<MonitorInfo> enumerate();
 
     /**
-     * @brief デバイス名からモニター番号を抽出する
-     * @param device_name  デバイス名 (例: "\\.\DISPLAY2")
-     * @return モニター番号 (2)、抽出失敗時は -1
+     * @brief Extracts the monitor number from a device name.
+     * @param device_name  Device name (e.g. "\\.\DISPLAY2")
+     * @return The number (2 in the example), or -1 on failure
      */
     static int extract_number(const std::string& device_name);
 
     /**
-     * @brief ミラーリングドライバかどうかを判定する
-     * @param device_name  デバイス名
-     * @return ミラーリングドライバなら true
+     * @brief Returns whether the device is a mirroring driver.
+     * @param device_name  Device name
+     * @return true for a mirroring driver
      */
     static bool is_mirror_driver(const std::string& device_name);
 };

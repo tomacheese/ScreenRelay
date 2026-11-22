@@ -52,6 +52,7 @@ int run_log_sink_tests() {
         std::vector<std::string> lines;
         std::ifstream in(dir / "t.jsonl");
         for (std::string line; std::getline(in, line);) lines.push_back(line);
+        in.close();  // Windows cannot remove a directory that holds an open file
         VERIFY(lines.size() == 3);
 
         for (int i = 0; i < 2; ++i) {

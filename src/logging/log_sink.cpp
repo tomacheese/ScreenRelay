@@ -1,5 +1,6 @@
 #include "logging/log_sink.hpp"
 #include "common/time_utils.hpp"
+#include "common/url_utils.hpp"
 #include <spdlog/sinks/rotating_file_sink.h>
 #include <spdlog/sinks/stdout_color_sinks.h>
 #include <cstdio>
@@ -90,7 +91,8 @@ std::string LogSink::build_json(const std::string& event_name,
     oss << "{\"ts\":\"" << time_utils::iso8601_now() << "\"";
     oss << ",\"event\":\"" << json_escape(event_name) << "\"";
     for (const auto& kv : fields) {
-        oss << ",\"" << json_escape(kv.first) << "\":\"" << json_escape(kv.second) << "\"";
+        const std::string value = (kv.first == "url") ? url_utils::redact_url(kv.second) : kv.second;
+        oss << ",\"" << json_escape(kv.first) << "\":\"" << json_escape(value) << "\"";
     }
     oss << "}";
     return oss.str();

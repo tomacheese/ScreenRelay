@@ -7,6 +7,7 @@ extern int run_backoff_tests();
 extern int run_metrics_tests();
 extern int run_monitor_detector_tests();
 extern int run_audio_pipeline_tests();
+extern int run_log_sink_tests();
 
 // Runs every test module in order; a failing VERIFY exits the process with status 1.
 int main() {
@@ -17,6 +18,7 @@ int main() {
     run_metrics_tests();
     run_monitor_detector_tests();
     run_audio_pipeline_tests();
+    run_log_sink_tests();
     printf("\nAll tests passed.\n");
     return 0;
 }

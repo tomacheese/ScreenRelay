@@ -153,7 +153,7 @@ Logged right after the encoder is initialized, with `monitor` and `active` (`"tr
 
 ### publish_started
 
-Logged when RTSP publishing starts (also after a successful reconnect). One event is logged per published URL, so the primary monitor logs a second one for the `/screen0` alias.
+Logged when RTSP publishing starts (also after a successful reconnect). One event is logged per published URL, so the primary monitor logs a second one for the `/screen0` alias. The `url` field is redacted in every event: userinfo (`user:pass@`) becomes `***@`, the query becomes `?***`, and the fragment is dropped.
 
 ```json
 {"ts":"2026-04-30T19:21:02.000Z","event":"publish_started","fps":"60","height":"1080","monitor":"1","url":"rtsp://192.168.0.100:8554/screen1","width":"1920"}
@@ -201,7 +201,7 @@ Logged once at the end of shutdown, after the grace period.
 
 ### error
 
-Logged (level `err`) when an error occurs. `code` and `message` are always present; other fields (typically `monitor` and `url`) depend on the error.
+Logged (level `err`) when an error occurs. `code` and `message` are always present; other fields (typically `monitor` and `url`, which is redacted as described under `publish_started`) depend on the error.
 
 ```json
 {"ts":"2026-04-30T19:30:00.000Z","event":"error","code":"RTSP_SEND_FAILED","message":"send_packet failed for monitor 1","monitor":"1","url":"rtsp://..."}
